@@ -651,6 +651,18 @@ pub(crate) fn walk_trusting(
         )));
     }
     stats.memory_bytes = sized.bytes;
+    // The proof limb, from the frame (lane INTAKE-BOUND), before the stream
+    // computes any merkle path's root. Read after the memory limb so a body
+    // past both names the memory limb, as it did before this limb existed;
+    // both are read from the frame and nothing is parsed before either.
+    if let Err(stop) = budget.proof_limb(beef_bytes) {
+        return Err(EngineError::ScriptWalkOverBudget {
+            at_txid: subject_txid.to_string(),
+            subject_judged: false,
+            limb: DoorLimb::Proof,
+            what: stop.to_string(),
+        });
+    }
     let index = DoorIndex::read(beef_bytes)?;
     if admission == Admission::Unfollowed {
         // The stream read a frame the sizing read did not follow, so what was

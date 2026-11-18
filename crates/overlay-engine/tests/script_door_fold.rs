@@ -1259,10 +1259,26 @@ fn e585f_a_breach_names_its_limb() {
             limb_of(engine.verify_scripts_only(&body, &subject).await),
             DoorLimb::Memory
         );
-        // The same BUMP under a budget that holds it is walked: the limb is a
+        // The memory limb lifted alone: the same BUMP (2^17 leaves, past the
+        // proof limb's default) is stopped by the PROOF limb, read from the
+        // frame after the memory limb (lane INTAKE-BOUND).
+        let memory_only = DoorBudget {
+            max_memory_bytes: 128 * 1024 * 1024,
+            ..DoorBudget::DEFAULT
+        };
+        assert_eq!(
+            limb_of(
+                engine
+                    .verify_scripts_only_under(&body, &subject, memory_only)
+                    .await
+            ),
+            DoorLimb::Proof
+        );
+        // The same BUMP under a budget that holds it is walked: the limbs are a
         // budget of the platform, not a rule about a BUMP.
         let roomy = DoorBudget {
             max_memory_bytes: 128 * 1024 * 1024,
+            max_proof_nodes: u64::MAX,
             ..DoorBudget::DEFAULT
         };
         let stats = engine
@@ -1349,8 +1365,12 @@ fn e585f_l3_the_memory_estimate_is_above_the_measured_heap() {
         let (body, subject) = diamond_chain(100).await;
         shapes.push(("199 signed inputs over 100 transactions", body, subject));
 
+        // The memory limb lifted, and the proof limb with it (lane
+        // INTAKE-BOUND): the 2^18-leaf BUMP is past the proof limb's default,
+        // which would stop it at the frame before the walk is measured.
         let lifted = DoorBudget {
             max_memory_bytes: u64::MAX,
+            max_proof_nodes: u64::MAX,
             ..DoorBudget::DEFAULT
         };
         let engine = engine();

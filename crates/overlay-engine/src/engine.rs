@@ -617,6 +617,16 @@ pub struct DoorBudget {
     /// that input runs and released after it. An input is run only while the
     /// frame's estimate plus its own charge is within this limb.
     pub max_memory_bytes: u64,
+    /// THE PROOF LIMB (lane INTAKE-BOUND): the most BUMP nodes, every BUMP
+    /// and every level, a body's frame may carry before anything of it is
+    /// parsed, hashed or allocated ([`crate::stream_sizing::proof_limb`],
+    /// [`DoorBudget::proof_limb`]). The SDK's parse of a merkle path computes
+    /// its root, a hash a node, so a body's parse costs CPU in its node count;
+    /// every door that reads a body reads this limb first. Default:
+    /// [`crate::beef_limits::LINK_ANCESTRY_PROOF_NODES_MAX`], the most nodes
+    /// an ancestry the engine's link estimate admits can carry, so no ancestry
+    /// linked today is stopped by it.
+    pub max_proof_nodes: u64,
 }
 
 impl DoorBudget {
@@ -701,7 +711,23 @@ impl DoorBudget {
         max_work_bytes: 64 * 1024 * 1024,
         sig_check_floor: 64 * 1024,
         max_memory_bytes: 48 * 1024 * 1024,
+        max_proof_nodes: crate::beef_limits::LINK_ANCESTRY_PROOF_NODES_MAX,
     };
+
+    /// The proof limb over `body` ([`crate::stream_sizing::proof_limb`] at
+    /// [`DoorBudget::max_proof_nodes`]): the frame's count, or the stop.
+    pub fn proof_limb(
+        &self,
+        body: &[u8],
+    ) -> Result<crate::stream_sizing::ProofFrame, crate::stream_sizing::ProofLimbStop> {
+        crate::stream_sizing::proof_limb(body, self.max_proof_nodes)
+    }
+
+    /// [`DoorBudget::proof_limb`] over one merkle path's bytes
+    /// ([`crate::stream_sizing::path_proof_limb`]).
+    pub fn path_proof_limb(&self, path: &[u8]) -> Result<u64, crate::stream_sizing::ProofLimbStop> {
+        crate::stream_sizing::path_proof_limb(path, self.max_proof_nodes)
+    }
 }
 
 /// Which limb of the [`DoorBudget`] a walk went past.
@@ -719,6 +745,10 @@ pub enum DoorLimb {
     /// coin proven below the Genesis height whose spend is not one both eras
     /// judge alike. A decline, never a refusal: the network judges.
     Era,
+    /// The proof limb ([`DoorBudget::max_proof_nodes`], lane INTAKE-BOUND):
+    /// the body's merkle paths carry more nodes than the limb, read from the
+    /// frame before anything was parsed. Nothing was read.
+    Proof,
 }
 
 /// What [`Engine::run_validation`] answers: the topics' validations, the
@@ -756,6 +786,14 @@ pub enum WalkLimb {
     /// `WalkBreachPolicy::NetworkAccepted` the submit goes on with its subject
     /// unlinked and reports it.
     OverLink,
+    /// The proof limb ([`DoorBudget::max_proof_nodes`], lane INTAKE-BOUND):
+    /// the body's merkle paths carry more nodes than the limb, counted from
+    /// the frame before anything was parsed. Under EVERY policy and in every
+    /// mode: going on would pay exactly what the limb bounds. Unlike the
+    /// other limbs the same bytes are stopped at any time (a proof does not
+    /// get narrower with a block): the sender's remedy is the same
+    /// transactions with merkle paths that carry only the nodes they need.
+    OverProof,
 }
 
 impl WalkLimb {
@@ -767,6 +805,7 @@ impl WalkLimb {
             WalkLimb::OverWork | WalkLimb::InterpreterMemory => DoorLimb::Work,
             WalkLimb::OverMemory | WalkLimb::OverLink => DoorLimb::Memory,
             WalkLimb::CoinEra => DoorLimb::Era,
+            WalkLimb::OverProof => DoorLimb::Proof,
         }
     }
 
@@ -779,6 +818,31 @@ impl WalkLimb {
             WalkLimb::InterpreterMemory => "interpreter_memory",
             WalkLimb::OverLink => "over_link",
             WalkLimb::CoinEra => "coin_era",
+            WalkLimb::OverProof => "over_proof",
+        }
+    }
+
+    /// Whether the same bytes are stopped at any later time (the proof limb
+    /// alone): no block makes them pass, so a client must not retry them.
+    #[must_use]
+    pub fn same_bytes_will_fail(self) -> bool {
+        matches!(self, WalkLimb::OverProof)
+    }
+}
+
+impl WalkCouldNotRun {
+    /// The proof limb's stop as a submit's "could not run" (lane
+    /// INTAKE-BOUND): the subject the atomic prefix names, else empty
+    /// (nothing of the body was parsed to find it).
+    #[must_use]
+    pub fn over_proof(stop: &crate::stream_sizing::ProofLimbStop) -> Self {
+        let txid = stop.subject.clone().unwrap_or_default();
+        WalkCouldNotRun {
+            subject_txid: txid.clone(),
+            at_txid: txid,
+            subject_judged: false,
+            limb: WalkLimb::OverProof,
+            what: stop.to_string(),
         }
     }
 }
@@ -3315,7 +3379,19 @@ impl Engine {
                     DoorLimb::Era => WalkLimb::CoinEra,
                     DoorLimb::Work if trace.interpreter_tripped => WalkLimb::InterpreterMemory,
                     DoorLimb::Work => WalkLimb::OverWork,
+                    DoorLimb::Proof => WalkLimb::OverProof,
                 };
+                if limb == WalkLimb::OverProof {
+                    // Nothing was read: no root to check (its check parses
+                    // the body the limb kept unread).
+                    return Ok(Some(WalkCouldNotRun {
+                        subject_txid: subject_txid.to_string(),
+                        at_txid,
+                        subject_judged,
+                        limb,
+                        what,
+                    }));
+                }
                 // THE ROOTS OF A BREACHED WALK (the E592 lens fold, H1): every
                 // proven transaction it reached, and every proven source an
                 // input read, whatever the scripts' verdict. A bad root is
@@ -3665,6 +3741,17 @@ impl Engine {
             if !self.managers.contains_key(topic) {
                 return Err(EngineError::UnsupportedTopic(topic.clone()));
             }
+        }
+
+        // THE PROOF LIMB, from the frame, before anything of the body is
+        // parsed (lane INTAKE-BOUND): every parse below (this one, the link,
+        // the predecessor question's, a landing's, the walk's stream) computes
+        // each merkle path's root again. Under every policy and in every mode:
+        // going on would pay exactly what the limb bounds.
+        if let Err(stop) = self.walk_budget.proof_limb(&tagged_beef.beef) {
+            return Err(EngineError::WalkCouldNotRun(WalkCouldNotRun::over_proof(
+                &stop,
+            )));
         }
 
         // Parse the SUBJECT from the BEEF — order-independent (`subject.rs`,
@@ -6708,6 +6795,16 @@ async fn verify_spv_trusting(
     trusted: &HashSet<String>,
     budget: DoorBudget,
 ) -> Result<Option<WalkCouldNotRun>, EngineError> {
+    // The proof limb before either check parses the body (lane INTAKE-BOUND):
+    // the GASP anchor's root BEEF reaches here first.
+    if let Err(stop) = budget.proof_limb(beef_bytes) {
+        let mut stop = WalkCouldNotRun::over_proof(&stop);
+        if stop.subject_txid.is_empty() {
+            stop.subject_txid = subject_txid.to_string();
+            stop.at_txid = subject_txid.to_string();
+        }
+        return Ok(Some(stop));
+    }
     if verify_scripts {
         Engine::verify_beef_linear(chain_tracker, beef_bytes, subject_txid, trusted, budget).await
     } else {
@@ -7044,6 +7141,8 @@ fn parse_lookup_advertisement(
     protocol: &[u8],
     scope: &str,
 ) -> Option<String> {
+    // A tracker's answer past the proof limb's default is not read (lane INTAKE-BOUND).
+    DoorBudget::DEFAULT.proof_limb(&output.beef).ok()?;
     let tx =
         beef_limits::subject_from_beef(&output.beef, None, &beef_limits::PEER_BEEF_LIMITS).ok()?;
     let script = tx
@@ -7202,16 +7301,31 @@ pub enum EngineError {
     /// PROVEN: a proven transaction is not walked, so an honest body too
     /// big to walk unmined lands once its block is mined (a client retries
     /// after the block, not at once).
-    #[error(
-        "the script walk could not run within the budget ({}: {}); not now: present the subject proven, after its block",
-        .0.limb.as_str(),
-        .0.what
-    )]
+    #[error("{}", walk_could_not_run_words(.0))]
     WalkCouldNotRun(WalkCouldNotRun),
 
     /// Any other failure, with its message.
     #[error("{0}")]
     Other(String),
+}
+
+/// The words of [`EngineError::WalkCouldNotRun`]: "not now, after the block"
+/// for every limb a block lifts, and for the proof limb (which no block
+/// lifts) the sender's remedy.
+fn walk_could_not_run_words(stop: &WalkCouldNotRun) -> String {
+    if stop.limb.same_bytes_will_fail() {
+        format!(
+            "the body could not be read within the budget ({}: {}); the same bytes are stopped at any time",
+            stop.limb.as_str(),
+            stop.what
+        )
+    } else {
+        format!(
+            "the script walk could not run within the budget ({}: {}); not now: present the subject proven, after its block",
+            stop.limb.as_str(),
+            stop.what
+        )
+    }
 }
 
 impl From<StorageError> for EngineError {
