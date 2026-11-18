@@ -694,6 +694,11 @@ pub(crate) fn read_export(inputs: &[PathBuf], r2_dir: Option<&Path>) -> Result<S
                 s.refused(table, &key, None, "read_for_replay", &fault);
                 continue;
             }
+            ReadStep::OverProof { fault } => {
+                // lane INTAKE-BOUND: a parked letter the consumer would not read.
+                s.refused(table, &key, None, "over_proof", &fault);
+                continue;
+            }
             ReadStep::Acked(verdict) => {
                 // `DirBytes` judges no missing object: never reached.
                 s.unread += 1;

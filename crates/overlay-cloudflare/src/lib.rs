@@ -2014,6 +2014,26 @@ async fn queue_handler(
                 }
                 continue;
             }
+            crate::queue::ReadStep::OverProof { fault } => {
+                // lane INTAKE-BOUND: the body was not parsed; classed by the engine's rule for a walk that could not
+                // run (`replay_error_class`: not now), retried, then parked under #576's bounds.
+                let e = crate::queue::over_proof_error(&fault);
+                worker::console_log!("Queue: the body was not read ({e}) — retrying; it parks by the engine's class");
+                if let Some(db) = &counters {
+                    crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_REPLAY_OVER_PROOF, 1).await;
+                    crate::ops::bump_counter(db, crate::ops::COUNTER_QUEUE_MUTATION_RETRIED, 1).await;
+                    crate::dead_letters::note_failing(
+                        db,
+                        body,
+                        None,
+                        &format!("failed: {e}"),
+                        crate::queue::replay_error_class(&e),
+                    )
+                    .await;
+                }
+                msg.retry();
+                continue;
+            }
         };
 
         let tagged_beef = TaggedBEEF {
@@ -2494,6 +2514,8 @@ mod arcade_vector_replay;
 
 #[cfg(test)]
 mod beef_door_replay;
+#[cfg(test)]
+mod intake_bound_tests;
 
 // bsv-low #585 (E585-land): the stored-rows reader, a native test-only tool
 // that reads a D1 export through the Worker's own readers.

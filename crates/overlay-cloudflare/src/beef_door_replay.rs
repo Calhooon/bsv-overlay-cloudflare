@@ -379,6 +379,10 @@ mod twin {
             let bytes = match step {
                 queue::ReadStep::Bytes(b) => b,
                 queue::ReadStep::Acked(v) => return Delivered::Acked(v),
+                queue::ReadStep::OverProof { fault } => {
+                    self.note(m, None, &fault, Some(dead_letters::LetterClass::NotNow));
+                    return Delivered::Fault(fault);
+                }
                 queue::ReadStep::Fault { fault, missing } => {
                     let class = (!missing).then_some(dead_letters::LetterClass::Fault);
                     self.note(m, None, &fault, class);
