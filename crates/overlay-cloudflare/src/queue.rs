@@ -931,6 +931,30 @@ pub async fn delete_beefs(env: &worker::Env, keys: &[String], why: &str) -> Vec<
     faults
 }
 
+/// PURE: what [`enqueue_replay`] puts and sends (INTAKE-BOUND-FOLD-2, the delta review's L3: the gated invariant's
+/// belt pinned by behaviour). A MARKED message is planned only for bytes the Worker's proof limb holds
+/// ([`gated_bytes_within_the_limb`]): the gated arm never marks bytes past it (the route's entry stops such a body
+/// before the arm runs, so this is a belt); an unmarked message is planned as before.
+pub(crate) fn plan_enqueue(
+    beef: &[u8],
+    topics: &[String],
+    mode: SubmitMode,
+    room: usize,
+    gated: bool,
+) -> Result<Carriage, String> {
+    if gated {
+        gated_bytes_within_the_limb(beef)?;
+    }
+    Ok(plan_replay_gated(
+        beef,
+        topics,
+        mode,
+        REPLAY_REASON_PHASE3_FAULT,
+        room,
+        gated,
+    ))
+}
+
 /// Enqueue the S2 replay for an undurable admission. `Err` names why the
 /// bytes are NOT in the queue (a missing binding, an R2 write or a send that
 /// faulted) so the route can refuse with the reason; never the body's size. A
@@ -945,16 +969,13 @@ pub async fn enqueue_replay(
     mode: SubmitMode,
     gated: bool,
 ) -> Result<(), String> {
-    if gated {
-        gated_bytes_within_the_limb(beef)?;
-    }
     let room = inline_room(
         env.var(QUEUE_MESSAGE_ROOM_VAR)
             .ok()
             .map(|v| v.to_string())
             .as_deref(),
     );
-    let carriage = plan_replay_gated(beef, topics, mode, REPLAY_REASON_PHASE3_FAULT, room, gated);
+    let carriage = plan_enqueue(beef, topics, mode, room, gated)?;
     if let Carriage::R2(msg) = &carriage {
         if let Some(r) = &msg.r2 {
             put_beef(env, r, beef).await?;

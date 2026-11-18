@@ -777,6 +777,46 @@ fn deferral_answer(
     }
 }
 
+/// The stream a gated job puts at rest: the BEEF, then the off-chain values. A span is copied out of the two
+/// slices, never out of a joined copy.
+pub(crate) struct AtRestStream<'a> {
+    beef: &'a [u8],
+    rest: &'a [u8],
+}
+
+impl AtRestStream<'_> {
+    /// The stream's length.
+    pub(crate) fn total(&self) -> usize {
+        self.beef.len() + self.rest.len()
+    }
+
+    /// The bytes `start..end` of the stream.
+    pub(crate) fn span(&self, start: usize, end: usize) -> Vec<u8> {
+        let (beef, rest) = (self.beef, self.rest);
+        let mut out = Vec::with_capacity(end - start);
+        if start < beef.len() {
+            out.extend_from_slice(&beef[start..end.min(beef.len())]);
+        }
+        if end > beef.len() {
+            out.extend_from_slice(&rest[start.max(beef.len()) - beef.len()..end - beef.len()]);
+        }
+        out
+    }
+}
+
+/// PURE: the stream `put_at_rest` stores, only for bytes the Worker's proof limb holds
+/// ([`crate::queue::gated_bytes_within_the_limb`]; INTAKE-BOUND-FOLD-2, the delta review's L3: the gated
+/// invariant's belt pinned by behaviour). `put_at_rest` reads its bytes through this function and nothing else.
+pub(crate) fn at_rest_stream(
+    tagged: &overlay_engine::types::TaggedBEEF,
+) -> Result<AtRestStream<'_>, String> {
+    crate::queue::gated_bytes_within_the_limb(&tagged.beef)?;
+    Ok(AtRestStream {
+        beef: &tagged.beef,
+        rest: tagged.off_chain_values.as_deref().unwrap_or(&[]),
+    })
+}
+
 async fn put_at_rest(
     env: &Env,
     tagged: &overlay_engine::types::TaggedBEEF,
@@ -787,8 +827,9 @@ async fn put_at_rest(
     delay_secs: Option<u32>,
 ) -> Result<String, String> {
     // The gated arm never puts at rest bytes past the Worker's proof limb (the fold's M1): the route's entry stops
-    // such a body before this arm runs, so this is a belt, unreachable from the route.
-    crate::queue::gated_bytes_within_the_limb(&tagged.beef)?;
+    // such a body before this arm runs, so this is a belt, unreachable from the route. Its bytes are read
+    // through the one pure function that checks them (`at_rest_stream`).
+    let stream = at_rest_stream(tagged)?;
     let db = env
         .d1("OVERLAY_DB")
         .map_err(|e| format!("OVERLAY_DB: {e}"))?;
@@ -801,21 +842,8 @@ async fn put_at_rest(
             return Ok(reference);
         }
     }
-    let beef = &tagged.beef[..];
-    let rest = off_chain.unwrap_or(&[]);
-    let total = beef.len() + rest.len();
-    // The stored stream is the BEEF, then the off-chain values; a span is
-    // copied out of the two slices, never out of a joined copy.
-    let span = |start: usize, end: usize| -> Vec<u8> {
-        let mut out = Vec::with_capacity(end - start);
-        if start < beef.len() {
-            out.extend_from_slice(&beef[start..end.min(beef.len())]);
-        }
-        if end > beef.len() {
-            out.extend_from_slice(&rest[start.max(beef.len()) - beef.len()..end - beef.len()]);
-        }
-        out
-    };
+    let total = stream.total();
+    let span = |start: usize, end: usize| stream.span(start, end);
     let (at_rest, chunks) = match env.bucket(BEEF_BLOBS_BINDING) {
         Ok(bucket) => {
             // L1 (a): R2 checks the sha256 it is given against what it stored (door 3's rule,
@@ -856,7 +884,7 @@ async fn put_at_rest(
         .bind(topics)
         .bind(submit_mode)
         .bind(off_chain.is_some())
-        .bind(beef.len() as i64)
+        .bind(stream.beef.len() as i64)
         .bind(total as i64)
         .bind(at_rest)
         .bind(chunks as i64)

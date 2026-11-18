@@ -260,7 +260,11 @@ enum LadderReanchor {
     Fault(String),
 }
 
-/// The anchor a verified pushed proof names for `txid`.
+/// The anchor a verified pushed proof names for `txid`. Its bytes are the ladder's verified proof
+/// (`verified_proof_for_exhaustive`), already read under the courier field's 8 KiB bound
+/// (`proof_fetcher::verify_bump_detailed`, `merkle_path_from_hex(.., COURIER_PROOF_MAX_BYTES)`), so the proof limb
+/// could never bind on this read (INTAKE-BOUND-FOLD-2, the delta review's N3: of the sweep's three
+/// `stored_proof_from_hex` reads only `verify_bump_memoized`'s, a stored own bump, could ever meet it).
 fn pushed_anchor(hex: &str, txid: &str) -> Option<BumpAnchor> {
     let mp = beef_limits::stored_proof_from_hex(hex).ok()?;
     let root = mp.compute_root(Some(txid)).ok()?.to_ascii_lowercase();
@@ -698,6 +702,8 @@ async fn courier_recheck(
             return;
         }
     };
+    // The ladder's verified proof, already read under the courier field's 8 KiB bound
+    // (`proof_fetcher::verify_bump_detailed`): the proof limb could never bind here (the delta review's N3).
     let proof_height = beef_limits::stored_proof_from_hex(&proof_hex)
         .ok()
         .map(|mp| u64::from(mp.block_height));
