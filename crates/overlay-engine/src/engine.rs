@@ -801,7 +801,10 @@ pub enum WalkLimb {
     /// sender's remedy is the same transactions with merkle paths that carry
     /// only the nodes they need, or, for a body all of whose nodes are
     /// needed, the subject presented proven after its block (it then carries
-    /// one path) or fewer proven parents spent by one transaction.
+    /// one path) or fewer proven parents spent by one transaction. The
+    /// stop's words say what this submit did (it read nothing of the body
+    /// past the count, asked no manager, wrote nothing), never what happened
+    /// to the same bytes elsewhere, which the engine does not know.
     OverProof,
 }
 
@@ -3836,7 +3839,11 @@ impl Engine {
         // manager is asked, or, under `NetworkAccepted`, this submit goes on
         // as under `HistoricalTxNoSpv` and the report says so.
         // A proof trip names the subject the parse found (the atomic prefix
-        // may name none) and is the submit's stop: the walk is not run.
+        // may name none) and is the submit's stop: the walk is not run. The
+        // `could_not_run.is_none()` guard below is not pinned alone: the
+        // walk's own first read (`verify_spv_trusting`) is the same limb under
+        // the same budget, so removing the guard answers the same stop (the
+        // delta review's N1, an equivalent mutant).
         let mut could_not_run = proof_stop.map(|mut stop| {
             stop.subject_txid.clone_from(&txid);
             stop.at_txid.clone_from(&txid);
@@ -7337,11 +7344,17 @@ pub enum EngineError {
 
 /// The words of [`EngineError::WalkCouldNotRun`]: "not now, after the block"
 /// for every limb a block lifts, and for the proof limb (which no block
-/// lifts) the sender's remedy.
+/// lifts) what THIS submit did and the remedy true for every body (the
+/// stop's own words, `stop.what`). They say nothing of what happened to the
+/// bytes elsewhere (whether they were broadcast, queued or written by
+/// another call): the engine does not know, and every caller reads them, the
+/// queue consumer's note of a message that WAS queued and a library caller
+/// that broadcast first included (INTAKE-BOUND-FOLD-2, the delta review's
+/// L6).
 fn walk_could_not_run_words(stop: &WalkCouldNotRun) -> String {
     if stop.limb.same_bytes_will_fail() {
         format!(
-            "the body could not be read within the budget ({}: {}); the same bytes are stopped at any time; nothing was broadcast, admitted or queued, so a sender who needs this body broadcast takes it to a broadcaster",
+            "the body could not be read within the budget ({}: {}); this submit read nothing of the body past the count, asked no topic manager and wrote nothing; the same bytes are stopped at any time",
             stop.limb.as_str(),
             stop.what
         )
