@@ -441,9 +441,9 @@ fn ibf_w_m1_the_gated_arm_never_marks_bytes_past_the_limb() {
     let topics = vec!["tm_a".to_string()];
     let mode = overlay_engine::types::SubmitMode::HistoricalTx;
     let room = crate::queue::QUEUE_MESSAGE_ROOM;
-    let e = crate::queue::plan_enqueue(&past, &topics, mode, room, true)
-        .err()
-        .expect("a marked message past the limb is never planned");
+    let Err(e) = crate::queue::plan_enqueue(&past, &topics, mode, room, true) else {
+        panic!("a marked message past the limb is never planned")
+    };
     assert!(e.contains("(the proof limb;"), "{e}");
     for (body, gated) in [
         (&small_body(), true),
@@ -463,9 +463,9 @@ fn ibf_w_m1_the_gated_arm_never_marks_bytes_past_the_limb() {
         topics: topics.clone(),
         off_chain_values: Some(vec![9, 8, 7]),
     };
-    let e = crate::ef_deferred::at_rest_stream(&tagged(past.clone()))
-        .err()
-        .expect("a job past the limb is never put at rest");
+    let Err(e) = crate::ef_deferred::at_rest_stream(&tagged(past.clone())) else {
+        panic!("a job past the limb is never put at rest")
+    };
     assert!(e.contains("(the proof limb;"), "{e}");
     let small = tagged(small_body());
     let stream = crate::ef_deferred::at_rest_stream(&small).expect("under the limb");
