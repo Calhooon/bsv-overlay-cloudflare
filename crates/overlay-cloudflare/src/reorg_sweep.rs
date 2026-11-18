@@ -74,7 +74,10 @@ pub(crate) async fn verify_bump_memoized(
     bump_hex: &str,
     txid: &str,
 ) -> Result<bool, String> {
-    let bump = match beef_limits::proof_from_hex(bump_hex) {
+    // A STORED own bump is this service's row, read as on `main`: no proof
+    // limb (the fold's M2: a limb stop here read as refuted and could demote
+    // a confirmed spend).
+    let bump = match beef_limits::stored_proof_from_hex(bump_hex) {
         Ok(b) => b,
         Err(_) => return Ok(false),
     };
@@ -259,7 +262,7 @@ enum LadderReanchor {
 
 /// The anchor a verified pushed proof names for `txid`.
 fn pushed_anchor(hex: &str, txid: &str) -> Option<BumpAnchor> {
-    let mp = beef_limits::proof_from_hex(hex).ok()?;
+    let mp = beef_limits::stored_proof_from_hex(hex).ok()?;
     let root = mp.compute_root(Some(txid)).ok()?.to_ascii_lowercase();
     Some(BumpAnchor {
         height: u64::from(mp.block_height),
@@ -695,7 +698,7 @@ async fn courier_recheck(
             return;
         }
     };
-    let proof_height = beef_limits::proof_from_hex(&proof_hex)
+    let proof_height = beef_limits::stored_proof_from_hex(&proof_hex)
         .ok()
         .map(|mp| u64::from(mp.block_height));
     match proof_height {
@@ -1397,6 +1400,55 @@ mod tests {
     use bsv_rs::transaction::{Beef, ChainTrackerError, MockChainTracker, Transaction};
     use overlay_discovery::pot::storage::{MemoryPotStorage, PotRecord};
     use std::sync::Mutex;
+
+    /// The fold's M2: a STORED own bump past the proof limb's default is read
+    /// as on `main` (`stored_proof_from_hex`): verified against its height's
+    /// canonical root, never refuted for its width, so the sweep demotes
+    /// nothing for it. RED on `69cee436` (`Ok(false)`: the limb's stop read as
+    /// refuted, the row re-anchored and, with no courier, demoted).
+    #[test]
+    fn ibf_m2_a_stored_bump_past_the_limb_is_verified_as_on_main() {
+        use bsv_rs::transaction::{MerklePath, MerklePathLeaf};
+        let txid = format!("{:064x}", 0xabcdu64);
+        let level0 = overlay_engine::beef_limits::LINK_ANCESTRY_PROOF_NODES_MAX + 2;
+        let mut level = vec![MerklePathLeaf::new_txid(0, txid.clone())];
+        for offset in 1..level0 {
+            level.push(MerklePathLeaf::new(offset, format!("{offset:064x}")));
+        }
+        let mut path = vec![level];
+        let mut width = level0;
+        while width > 1 {
+            width = width.div_ceil(2);
+            let mut row = Vec::new();
+            if width > 1 && width % 2 == 1 {
+                row.push(MerklePathLeaf {
+                    offset: width,
+                    hash: None,
+                    txid: false,
+                    duplicate: true,
+                });
+            }
+            path.push(row);
+        }
+        path.pop();
+        let bump = MerklePath::new(900_000, path).unwrap();
+        let root = bump.compute_root(Some(&txid)).unwrap();
+        let hex = bump.to_hex();
+        assert!(overlay_engine::beef_limits::proof_from_hex(&hex).is_err());
+        let mut memo = RootMemo::default();
+        memo.seed_canonical(900_000, &root);
+        let verdict = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(verify_bump_memoized(
+            &FaultyTracker,
+            &mut memo,
+            &hex,
+            &txid,
+        ));
+        assert_eq!(verdict, Ok(true), "the stored bump verifies as on main");
+        assert!(pushed_anchor(&hex, &txid).is_some());
+    }
 
     /// A tracker whose header source cannot be read (transport fault).
     struct FaultyTracker;

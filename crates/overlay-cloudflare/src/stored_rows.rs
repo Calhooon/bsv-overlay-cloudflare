@@ -141,6 +141,12 @@ pub(crate) struct Summary {
     pub differs: u64,
     /// PORT-0811: the raw-transaction columns read.
     pub raw_txs: u64,
+    /// Lane INTAKE-BOUND-FOLD (M5): the stored BEEFs (a stored own bump with
+    /// them), parked letters, keyed objects, deferred EF jobs and deferred
+    /// graph node proofs whose bytes are past the Worker's proof limb
+    /// (`OVER-PROOF .. kind=over_proof` lines). Counted apart: never a
+    /// refusal, never the run's failure; a count before a deploy.
+    pub over_proof: u64,
     pub census: std::collections::BTreeMap<&'static str, u64>,
     /// Every line printed, in order.
     pub lines: Vec<String>,
@@ -157,6 +163,14 @@ impl Summary {
         let offset = offset.map_or_else(|| "-".to_string(), |o| o.to_string());
         self.line(format!(
             "REFUSED table={table} key={key} offset={offset} kind={kind} detail={detail}"
+        ));
+    }
+
+    /// Bytes past the Worker's proof limb, named (lane INTAKE-BOUND-FOLD, M5).
+    fn over_proof(&mut self, table: &str, key: &str, detail: &str) {
+        self.over_proof += 1;
+        self.line(format!(
+            "OVER-PROOF table={table} key={key} kind=over_proof detail={detail}"
         ));
     }
 
@@ -228,7 +242,7 @@ impl Summary {
             let _ = write!(census, " {verdict}:{n}");
         }
         format!(
-            "SUMMARY rows={} beefs={} raw_txs={} bytes={} refusals={} unread={} differs={} over_memory={} largest_body={} ({}) largest_estimate={} ({}) deferred_records={} deferred_nodes={} census=[{}]",
+            "SUMMARY rows={} beefs={} raw_txs={} bytes={} refusals={} unread={} differs={} over_memory={} over_proof={} largest_body={} ({}) largest_estimate={} ({}) deferred_records={} deferred_nodes={} census=[{}]",
             self.rows,
             self.beefs,
             self.raw_txs,
@@ -237,6 +251,7 @@ impl Summary {
             self.unread,
             self.differs,
             self.over_memory,
+            self.over_proof,
             self.largest_body.0,
             self.largest_body.1,
             self.largest_estimate.0,
@@ -286,6 +301,11 @@ impl Summary {
                 est.bytes,
                 submit_census::CENSUS_MEMORY_BYTES
             ));
+        }
+        // The Worker's proof limb, named apart (the fold's M5): the stored
+        // readers read such a row as on `main`, so the read goes on.
+        if let Err(stop) = crate::WORKER_WALK_BUDGET.proof_limb(bytes) {
+            self.over_proof(table, key, &stop.to_string());
         }
         if let Err(refusal) = beef_limits::read_beef(bytes) {
             self.refused(
@@ -474,13 +494,13 @@ fn load_json(db: &Connection, table: &str, json: &str) -> Result<(), String> {
 struct DirBytes<'a>(Option<&'a Path>);
 
 impl ReplayBytes for DirBytes<'_> {
-    async fn read_beef(&self, r: &BeefRef) -> Result<Vec<u8>, BlobFault> {
+    async fn read_beef(&self, r: &BeefRef, limbed: bool) -> Result<Vec<u8>, BlobFault> {
         let got = self.0.and_then(|dir| {
             std::fs::read(dir.join(&r.key))
                 .or_else(|_| std::fs::read(dir.join(r.key.replace('/', "_"))))
                 .ok()
         });
-        queue::replay_object(r, got)
+        queue::replay_object(r, got, limbed)
     }
 
     async fn judge_missing(&self, _topics: &[String], _r: &BeefRef) -> MissingVerdict {
@@ -695,8 +715,9 @@ pub(crate) fn read_export(inputs: &[PathBuf], r2_dir: Option<&Path>) -> Result<S
                 continue;
             }
             ReadStep::OverProof { fault } => {
-                // lane INTAKE-BOUND: a parked letter the consumer would not read.
-                s.refused(table, &key, None, "over_proof", &fault);
+                // lane INTAKE-BOUND: a parked letter (without the gated mark) the consumer would not read: named,
+                // counted apart, never the run's failure (the fold's M5).
+                s.over_proof(table, &key, &fault);
                 continue;
             }
             ReadStep::Acked(verdict) => {
@@ -935,8 +956,14 @@ pub(crate) fn read_export(inputs: &[PathBuf], r2_dir: Option<&Path>) -> Result<S
                 s.refused(table, &node_key, None, "rawTx", &e.to_string());
             }
             if let Some(proof) = &walked.node.proof {
-                if let Err(e) = beef_limits::proof_from_hex(proof) {
-                    s.refused(table, &node_key, None, "proof", &e.to_string());
+                // A peer's proof at rest: read as the resume reads it (under the
+                // Worker's limb); past it, named apart (the fold's M5).
+                match crate::WORKER_WALK_BUDGET.proof_from_hex(proof) {
+                    Err(e) if beef_limits::is_proof_limb(&e) => {
+                        s.over_proof(table, &node_key, &e.to_string());
+                    }
+                    Err(e) => s.refused(table, &node_key, None, "proof", &e.to_string()),
+                    Ok(_) => {}
                 }
             }
         }
@@ -1612,6 +1639,96 @@ mod self_test {
             !reader_source().contains("fn blob("),
             "no reader of its own typing"
         );
+    }
+
+    /// The fold's M5: a stored BEEF past the Worker's proof limb (a proven
+    /// transaction whose own BUMP carries 65,538 nodes) and a parked letter
+    /// without the gated mark carrying it are NAMED (`OVER-PROOF ..
+    /// kind=over_proof`), counted apart (`over_proof` 2), never a refusal: the
+    /// verdict stays clean. A letter WITH the gated mark is read through (the
+    /// consumer takes it to the engine) and named too. RED on `69cee436` (no
+    /// such count; the letter a refusal).
+    #[test]
+    fn ibf_m5_the_reader_names_bytes_past_the_proof_limb_apart() {
+        use bsv_rs::transaction::{MerklePath, MerklePathLeaf, Transaction};
+        let mut tx = Transaction::new();
+        tx.inputs
+            .push(bsv_rs::transaction::TransactionInput::new("aa".repeat(32), 0));
+        tx.outputs.push(bsv_rs::transaction::TransactionOutput::new(
+            1,
+            bsv_rs::script::LockingScript::from_script(
+                bsv_rs::script::Script::from_binary(&[0x51]).unwrap(),
+            ),
+        ));
+        let level0 = beef_limits::LINK_ANCESTRY_PROOF_NODES_MAX + 2;
+        let mut level = vec![MerklePathLeaf::new_txid(0, tx.id())];
+        for offset in 1..level0 {
+            level.push(MerklePathLeaf::new(offset, format!("{offset:064x}")));
+        }
+        let mut path = vec![level];
+        let mut width = level0;
+        while width > 1 {
+            width = width.div_ceil(2);
+            let mut row = Vec::new();
+            if width > 1 && width % 2 == 1 {
+                row.push(MerklePathLeaf {
+                    offset: width,
+                    hash: None,
+                    txid: false,
+                    duplicate: true,
+                });
+            }
+            path.push(row);
+        }
+        path.pop();
+        tx.merkle_path = Some(MerklePath::new(900_000, path).unwrap());
+        let wide = tx.to_beef(false).unwrap();
+        let txid = tx.id();
+        assert!(crate::WORKER_WALK_BUDGET.proof_limb(&wide).is_err());
+        let letter = |key: &str, gated: bool| {
+            let b64 = {
+                use base64::{engine::general_purpose::STANDARD, Engine as _};
+                STANDARD.encode(&wide)
+            };
+            let mut m = serde_json::json!({"topics": ["tm_test"], "mode": "historical-tx",
+                "reason": queue::REPLAY_REASON_PHASE3_FAULT, "beef_b64": b64});
+            if gated {
+                m["gated"] = true.into();
+            }
+            format!(
+                "INSERT INTO \"mutation_dead_letters\" (txid, topics, message, status, first_seen_at, r2_key) VALUES({},'tm_test',{},'parked',1,NULL);\n",
+                sql_text(key),
+                sql_text(&m.to_string()),
+            )
+        };
+        let sql = schema_sql()
+            + &format!(
+                "INSERT INTO \"transactions\" VALUES({},{},1);\n",
+                sql_text(&txid),
+                sql_blob(&wide)
+            )
+            + &letter("aa", false)
+            + &letter("bb", true);
+        let s = read_sql("over-proof", &sql, None);
+        assert_eq!(
+            (s.over_proof, s.refusals, s.unread),
+            (3, 0, 0),
+            "{:?}",
+            s.lines
+        );
+        assert!(s.verdict().is_ok(), "{:?}", s.lines);
+        let named: Vec<&String> = s
+            .lines
+            .iter()
+            .filter(|l| l.starts_with("OVER-PROOF"))
+            .collect();
+        assert!(named
+            .iter()
+            .any(|l| l.contains(&format!("table=transactions key={txid} kind=over_proof"))));
+        assert!(named
+            .iter()
+            .any(|l| l.contains("table=mutation_dead_letters key=aa[tm_test] kind=over_proof")));
+        assert!(s.summary_line().contains(" over_proof=3 "), "{}", s.summary_line());
     }
 
     /// THE PIN (L3, the verdict). An UNREAD row FAILS the run: a letter

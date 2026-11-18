@@ -171,7 +171,7 @@ async fn crawl_one(
 
 pub(crate) const COUNTER_CRAWL_EXPIRED_REFUSED: &str = "crawl_expired_refused_total";
 
-fn expired_answer(entry: &OutputEntry, topic: &str, now: u64) -> Result<u64, String> {
+pub(crate) fn expired_answer(entry: &OutputEntry, topic: &str, now: u64) -> Result<u64, String> {
     if topic != "tm_uhrp" {
         return Ok(0);
     }

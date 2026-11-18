@@ -289,7 +289,11 @@ mod twin {
     }
 
     impl queue::ReplayBytes for Ports<'_> {
-        async fn read_beef(&self, r: &queue::BeefRef) -> Result<Vec<u8>, queue::BlobFault> {
+        async fn read_beef(
+            &self,
+            r: &queue::BeefRef,
+            _limbed: bool,
+        ) -> Result<Vec<u8>, queue::BlobFault> {
             let bytes = self
                 .bucket
                 .get(&r.key)
@@ -965,7 +969,11 @@ mod twin {
     fn e585_d3f2_l3_an_unlanded_missing_object_is_a_fault_never_an_ack() {
         struct Fixed(Result<Vec<u8>, queue::BlobFault>, queue::MissingVerdict);
         impl queue::ReplayBytes for Fixed {
-            async fn read_beef(&self, _: &queue::BeefRef) -> Result<Vec<u8>, queue::BlobFault> {
+            async fn read_beef(
+                &self,
+                _: &queue::BeefRef,
+                _: bool,
+            ) -> Result<Vec<u8>, queue::BlobFault> {
                 self.0.clone()
             }
             async fn judge_missing(
@@ -1397,7 +1405,11 @@ mod e592 {
         assert!(tail.contains(
             "return walk_not_now(env, &stop, \"POST /submit\", Some(counters)).await;"
         ));
-        assert!(tail.contains("counters.reason(SubmitReason::WalkCouldNotRun);"));
+        // lane INTAKE-BOUND-FOLD: the reason is the engine's error's (`walk_could_not_run`, or `walk_over_proof` for
+        // the proof limb)
+        assert!(tail.contains(
+            "counters.reason(SubmitReason::engine(&EngineError::WalkCouldNotRun(stop.clone())));"
+        ));
         assert!(
             tail.contains("crate::ops::note_engine_walk(&db, &mutation_report, \"POST /submit\")")
         );

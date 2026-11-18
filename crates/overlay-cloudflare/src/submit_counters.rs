@@ -107,7 +107,7 @@ pub(crate) fn counter_names(status: u16, reason: Reason) -> [String; 2] {
 }
 
 pub(crate) fn all_names() -> Vec<String> {
-    [200, 202, 400, 401, 422, 500, 502, 503]
+    [200, 202, 400, 401, 413, 422, 500, 502, 503]
         .into_iter()
         .map(|status| format!("submit_answer_{status}_total"))
         .chain(
