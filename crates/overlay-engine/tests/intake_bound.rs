@@ -434,13 +434,21 @@ fn ib_a_the_stop_holds_nothing() {
     // One merkle path's bytes: the same count.
     let p = prove_wide(coin(3), SMALL_LIMB);
     let bytes = p.merkle_path.as_ref().unwrap().to_binary();
-    assert_eq!(path_proof_limb(&bytes, SMALL_LIMB), Ok(SMALL_LIMB));
+    assert_eq!(
+        path_proof_limb(&bytes, SMALL_LIMB),
+        Ok(bsv_overlay_engine::stream_sizing::ProofFrame {
+            nodes: SMALL_LIMB,
+            read: true
+        })
+    );
     assert!(path_proof_limb(&bytes, SMALL_LIMB - 1).is_err());
 }
 
 /// The submits (every mode, both policies, and the validate-only call): one
-/// node past the limb is `WalkCouldNotRun` `OverProof` before any parse, and
-/// AT the limb the body is admitted as on the base. Under the small limb.
+/// node past the limb is `WalkCouldNotRun` `OverProof` before any parse
+/// under `NotNow` in EVERY mode (`historical-tx-no-spv` included), and goes on
+/// under `NetworkAccepted` (the fold's M1: as past every other limb); AT the
+/// limb the body is admitted as on the base. Under the small limb.
 #[test]
 fn ib_b_every_submit_stops_one_past_the_limb_and_admits_at_it() {
     let _g = one_at_a_time();
@@ -448,7 +456,7 @@ fn ib_b_every_submit_stops_one_past_the_limb_and_admits_at_it() {
     let engine = engine_under(small_budget());
     for (door, r) in block_on(every_submit(&engine, &bodies.past.0)) {
         match r {
-            Err(e) => {
+            Err(e) if !door.contains("NetworkAccepted") => {
                 assert!(over_proof(&e), "{door}: {e}");
                 assert!(
                     e.to_string()
@@ -456,6 +464,8 @@ fn ib_b_every_submit_stops_one_past_the_limb_and_admits_at_it() {
                     "{door}: {e}"
                 );
             }
+            Err(e) => panic!("{door}: the network's accept goes on past the limb: {e}"),
+            Ok(()) if door.contains("NetworkAccepted") => {}
             Ok(()) => panic!("{door}: one node past the limb was admitted"),
         }
     }
@@ -474,7 +484,10 @@ fn ib_b_the_default_stops_the_submit_before_its_parse() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
-    for policy in [WalkBreachPolicy::NotNow, WalkBreachPolicy::NetworkAccepted] {
+    // `NotNow` alone: under `NetworkAccepted` the submit goes on and reads the
+    // body (the fold's M1; `ibf_m1_*`).
+    {
+        let policy = WalkBreachPolicy::NotNow;
         let t = tagged(&body);
         let (r, held) = held_by(|| {
             rt.block_on(engine.submit_with_report_under(&t, SubmitMode::HistoricalTxNoSpv, policy))
@@ -675,5 +688,486 @@ fn ib_f_no_body_linked_today_is_stopped() {
             frame.nodes
         );
         assert!(proof_limb(body, default).is_ok(), "{name}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The fold (lane INTAKE-BOUND-FOLD).
+// ---------------------------------------------------------------------------
+
+/// The nodes bsv-rs parsed in `beef`'s BUMPs.
+fn sdk_nodes_of_beef(beef: &Beef) -> u64 {
+    beef.bumps
+        .iter()
+        .map(|m| m.path.iter().map(|l| l.len() as u64).sum::<u64>())
+        .sum()
+}
+
+/// A deterministic xorshift, so the differential is the same run to run.
+struct Xorshift(u64);
+impl Xorshift {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+}
+
+/// H1: THE FRAME READ NEVER COUNTS FEWER NODES THAN A READER THAT PAYS. Over
+/// generated and mutated merkle paths and BEEFs (V1, V2, atomic; a byte set,
+/// a bit flipped, a flag byte set to 0..=6, 0x80, 0xfd..=0xff, a byte
+/// doubled), deterministic seed: whenever bsv-rs's `MerklePath::from_binary`
+/// parses a path, the path read followed it (`read`) and counted at least its
+/// nodes, `proof_from_hex_under` refuses none of them and stops each one a
+/// node under its count; whenever the house's stream-first parse
+/// (`parse_beef`) or bsv-rs's `Beef::from_binary` parses a BEEF, the frame
+/// read counted at least its nodes and the limb one under them stops it.
+/// RED on `69cee436` (a flag byte outside 0, 1 and 2 ended the frame read
+/// with the nodes before it, and bsv-rs read on).
+#[test]
+fn ibf_h1_the_frame_read_never_counts_fewer_nodes_than_the_sdk() {
+    let _g = one_at_a_time();
+    let mut rng = Xorshift(0x1234_5678_9abc_def0);
+    let (mut bodies, mut paths_parsed, mut beefs_parsed, mut stream_parsed) = (0u64, 0, 0, 0);
+    for round in 0..3_000u32 {
+        let n = 2 * (1 + rng.next() % 20);
+        let a = prove_wide(coin(round), n);
+        let mp = a.merkle_path.clone().unwrap();
+        let s = spend(&[(a.id(), 0)], round + 7);
+        let mut beef = if rng.next().is_multiple_of(2) {
+            Beef::with_version(bsv_rs::transaction::BEEF_V1)
+        } else {
+            Beef::new()
+        };
+        let bi = beef.merge_bump(mp.clone());
+        beef.merge_raw_tx(a.to_binary(), Some(bi));
+        beef.merge_raw_tx(s.to_binary(), None);
+        let mut originals = vec![(mp.to_binary(), true), (beef.to_binary(), false)];
+        if rng.next().is_multiple_of(3) {
+            originals.push((beef.to_binary_atomic(&s.id()).unwrap(), false));
+        }
+        for (orig, is_path) in originals {
+            for _ in 0..6 {
+                let mut b = orig.clone();
+                for _ in 0..1 + rng.next() % 3 {
+                    let i = (rng.next() as usize) % b.len();
+                    match rng.next() % 4 {
+                        0 => b[i] = rng.next() as u8,
+                        1 => b[i] ^= 1 << (rng.next() % 8),
+                        2 => {
+                            b[i] = [0u8, 1, 2, 3, 4, 5, 6, 0x80, 0xfd, 0xfe, 0xff]
+                                [(rng.next() % 11) as usize]
+                        }
+                        _ => {
+                            let v = b[i];
+                            b.insert(i, v);
+                        }
+                    }
+                }
+                bodies += 1;
+                if is_path {
+                    let Ok(m) = MerklePath::from_binary(&b) else {
+                        continue;
+                    };
+                    paths_parsed += 1;
+                    let sdk: u64 = m.path.iter().map(|l| l.len() as u64).sum();
+                    let frame = path_proof_limb(&b, u64::MAX)
+                        .unwrap_or_else(|s| panic!("an unbounded read never stops: {s}"));
+                    assert!(
+                        frame.read && frame.nodes >= sdk,
+                        "a path bsv-rs parses ({sdk} nodes): the frame read {frame:?}: {}",
+                        hex::encode(&b)
+                    );
+                    beef_limits::proof_from_hex_under(&hex::encode(&b), u64::MAX)
+                        .unwrap_or_else(|e| panic!("refused a path bsv-rs parses: {e}"));
+                    if sdk > 0 {
+                        let e = beef_limits::proof_from_hex_under(&hex::encode(&b), sdk - 1)
+                            .expect_err("one node under the count stops it");
+                        assert!(beef_limits::is_proof_limb(&e), "{e}");
+                    }
+                } else {
+                    for (reader, parsed) in [
+                        (
+                            "Beef::from_binary",
+                            Beef::from_binary(&b).ok().map(|x| sdk_nodes_of_beef(&x)),
+                        ),
+                        (
+                            "parse_beef",
+                            beef_limits::parse_beef(&b, &beef_limits::ENGINE_BEEF_LIMITS)
+                                .ok()
+                                .map(|x| sdk_nodes_of_beef(&x)),
+                        ),
+                    ] {
+                        let Some(sdk) = parsed else {
+                            continue;
+                        };
+                        if reader == "parse_beef" {
+                            stream_parsed += 1;
+                        } else {
+                            beefs_parsed += 1;
+                        }
+                        let frame = proof_limb(&b, u64::MAX).unwrap();
+                        assert!(
+                            frame.nodes >= sdk,
+                            "{reader} parsed {sdk} nodes, the frame read {frame:?}: {}",
+                            hex::encode(&b)
+                        );
+                        if sdk > 0 {
+                            assert!(proof_limb(&b, sdk - 1).is_err(), "{reader}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    println!(
+        "ibf_h1: {bodies} bodies; paths bsv-rs parsed {paths_parsed}; BEEFs Beef::from_binary \
+         parsed {beefs_parsed}, parse_beef parsed {stream_parsed}"
+    );
+    assert!(bodies > 40_000 && paths_parsed > 1_000 && beefs_parsed > 1_000);
+}
+
+/// A path's bytes (BRC-74) of `n` level-0 hashed leaves, every flag `flag`,
+/// by hand (nothing hashed to build it).
+fn path_by_hand(n: u64, flag: u8) -> Vec<u8> {
+    let mut out = Vec::with_capacity(38 * n as usize + 64);
+    out.extend(bsv_rs::primitives::to_var_int(900_000));
+    out.push(18);
+    out.extend(bsv_rs::primitives::to_var_int(n));
+    for offset in 0..n {
+        out.extend(bsv_rs::primitives::to_var_int(offset));
+        out.push(flag);
+        out.extend([7u8; 32]);
+    }
+    out.extend([0u8; 17]);
+    out
+}
+
+/// H1: a path of 200,000 nodes whose flag bytes are 0x06 (bsv-rs reads a
+/// hash: bit 0 is clear) is stopped at the limb unparsed: the read holds a
+/// few hundred bytes, `proof_from_hex` no more than its own hex decode (under
+/// twice the path's bytes). RED
+/// on `69cee436` (`Ok(0)`, then every node parsed).
+#[test]
+fn ibf_h1_a_flag_0x06_path_of_200000_nodes_is_stopped_unparsed() {
+    let _g = one_at_a_time();
+    for flag in [0x06u8, 0x82, 0xfe] {
+        let bytes = path_by_hand(200_000, flag);
+        let (r, held) = held_by(|| path_proof_limb(&bytes, LINK_ANCESTRY_PROOF_NODES_MAX));
+        let stop = r.expect_err("stopped");
+        assert_eq!(stop.nodes, LINK_ANCESTRY_PROOF_NODES_MAX + 1, "{flag:#04x}");
+        assert!(held <= 512, "{flag:#04x}: the read held {held} bytes");
+        let hex = hex::encode(&bytes);
+        let (r, held) = held_by(|| beef_limits::proof_from_hex(&hex));
+        let e = r.expect_err("not parsed");
+        assert!(beef_limits::is_proof_limb(&e), "{flag:#04x}: {e}");
+        // The hex decode's growing buffer: under twice the path's bytes. A
+        // parse holds each leaf's hash as a hex string, several times more.
+        assert!(
+            held <= 2 * bytes.len() as u64,
+            "{flag:#04x}: proof_from_hex held {held} bytes for {} bytes of path",
+            bytes.len()
+        );
+    }
+    // The same path in a BEEF: the frame read counts it whatever its flags.
+    let mut body = Vec::new();
+    body.extend(bsv_rs::transaction::BEEF_V2.to_le_bytes());
+    body.push(1);
+    body.extend(path_by_hand(200_000, 0x06));
+    body.push(0);
+    let stop = proof_limb(&body, LINK_ANCESTRY_PROOF_NODES_MAX).expect_err("stopped");
+    assert_eq!(stop.nodes, LINK_ANCESTRY_PROOF_NODES_MAX + 1);
+}
+
+/// H1: what the path read does not follow is refused unparsed, a parse
+/// refusal and never the limb's stop; bsv-rs refuses each too.
+#[test]
+fn ibf_h1_a_path_the_read_does_not_follow_is_refused_unparsed() {
+    let _g = one_at_a_time();
+    let whole = prove_wide(coin(4), 8)
+        .merkle_path
+        .clone()
+        .unwrap()
+        .to_binary();
+    for cut in 1..whole.len() {
+        let b = &whole[..cut];
+        let e = beef_limits::proof_from_hex(&hex::encode(b)).expect_err("cut short");
+        assert!(!beef_limits::is_proof_limb(&e), "{cut}: {e}");
+        assert!(
+            MerklePath::from_binary(b).is_err(),
+            "{cut}: bsv-rs parses it"
+        );
+        if path_proof_limb(b, u64::MAX).is_ok_and(|f| !f.read) {
+            assert!(
+                e.to_string()
+                    .contains(beef_limits::PROOF_NOT_FOLLOWED_WORDS),
+                "{cut}: {e}"
+            );
+        }
+    }
+    // A non-canonical varint (bsv-rs refuses it too).
+    let mut b = whole.clone();
+    b.splice(0..1, [0xfd, 0x00, 0x00]);
+    assert!(MerklePath::from_binary(&b).is_err());
+    assert!(beef_limits::proof_from_hex(&hex::encode(&b)).is_err());
+    // A stored proof is read as on `main`: no limb.
+    let wide = hex::encode(path_by_hand(LINK_ANCESTRY_PROOF_NODES_MAX + 1, 0));
+    let e = beef_limits::stored_proof_from_hex(&wide).expect_err("junk hashes");
+    assert!(
+        !beef_limits::is_proof_limb(&e),
+        "the stored reader reads it: {e}"
+    );
+}
+
+/// M1 (ruling 2): under `NetworkAccepted` a submit past the proof limb goes
+/// on as past every other limb, in every mode: admitted, the trip reported
+/// (`walk_could_not_run`, limb `OverProof`, `walk_went_on`
+/// `NetworkAccepted`, the subject named). Under `NotNow` it stops in every
+/// mode, `historical-tx-no-spv` included. RED on `69cee436` (stopped under
+/// both policies).
+#[test]
+fn ibf_m1_the_networks_accept_goes_on_past_the_proof_limb() {
+    let _g = one_at_a_time();
+    let bodies = small_bodies();
+    for mode in [
+        SubmitMode::CurrentTx,
+        SubmitMode::HistoricalTx,
+        SubmitMode::HistoricalTxNoSpv,
+    ] {
+        let (steak, report) = block_on(engine_under(small_budget()).submit_with_report_under(
+            &tagged(&bodies.past.0),
+            mode,
+            WalkBreachPolicy::NetworkAccepted,
+        ))
+        .unwrap_or_else(|e| panic!("{mode:?}: goes on: {e}"));
+        assert_eq!(
+            steak.get(TOPIC).map(|a| a.outputs_to_admit.clone()),
+            Some(vec![0]),
+            "{mode:?}"
+        );
+        let stop = report.walk_could_not_run.as_ref().expect("reported");
+        assert_eq!(stop.limb, WalkLimb::OverProof, "{mode:?}");
+        assert_eq!(stop.subject_txid, bodies.past.1.id(), "{mode:?}");
+        assert_eq!(
+            report.walk_went_on,
+            Some(bsv_overlay_engine::engine::WalkWentOn::NetworkAccepted),
+            "{mode:?}"
+        );
+        let e = block_on(engine_under(small_budget()).submit_with_report_under(
+            &tagged(&bodies.past.0),
+            mode,
+            WalkBreachPolicy::NotNow,
+        ))
+        .expect_err("not now");
+        assert!(over_proof(&e), "{mode:?}: {e}");
+    }
+}
+
+/// M3 and N1: the anchor's ASSEMBLY reads each node's proof under the
+/// engine's CONFIGURED limb and HOLDS the graph (`AnchorWalkHeld`) on one
+/// past it; the ROOT BEEF's own read holds a graph whose node proofs each fit
+/// and together do not. Debug profile, a small limb. RED with the assembly's
+/// proof-limb branch made `Other`, or the `unassembled` hold arm removed
+/// (`AnchorUnavailable`), or the root's read removed.
+#[test]
+fn ibf_m3_the_anchor_holds_at_its_assembly_and_at_its_root() {
+    let _g = one_at_a_time();
+    block_on(async {
+        let store = MemoryStorage::new();
+        let manager = AdmitZero;
+        let gasp = || {
+            OverlayGASPStorage::new(&store, TOPIC, new_finalized_graph_sink())
+                .with_topic_manager(&manager)
+                .with_walk_budget(small_budget())
+        };
+        let node = |graph: &str, tx: &Transaction| GASPNode {
+            graph_id: graph.to_string(),
+            raw_tx: tx.to_hex(),
+            output_index: 0,
+            proof: tx.merkle_path.as_ref().map(MerklePath::to_hex),
+            tx_metadata: None,
+            output_metadata: None,
+            inputs: None,
+        };
+        // A root proven by a path past the small limb: held at the assembly.
+        let root_tx = prove_wide(coin(5), 2 * SMALL_LIMB);
+        let graph = format!("{}.0", root_tx.id());
+        let g = gasp();
+        g.append_to_graph(&node(&graph, &root_tx), None)
+            .await
+            .unwrap();
+        match g.validate_graph_anchor(&graph).await {
+            Err(GASPError::AnchorWalkHeld(why)) => {
+                assert!(why.contains(&format!("the proof of {graph}")), "{why}");
+                assert!(why.contains("over_proof"), "{why}");
+            }
+            other => panic!("held at the assembly: {other:?}"),
+        }
+        // An unproven root over two parents of 22 nodes each: each fits, the
+        // root BEEF (44) does not: held at the root BEEF.
+        let a = prove_wide(coin(6), 20);
+        let b = prove_wide(coin(7), 20);
+        assert!(nodes_of(&a) <= SMALL_LIMB && nodes_of(&a) + nodes_of(&b) > SMALL_LIMB);
+        let root = spend(&[(a.id(), 0), (b.id(), 0)], 12);
+        let graph = format!("{}.0", root.id());
+        let g = gasp();
+        g.append_to_graph(&node(&graph, &root), None).await.unwrap();
+        for parent in [&a, &b] {
+            g.append_to_graph(&node(&graph, parent), Some(&graph))
+                .await
+                .unwrap();
+        }
+        match g.validate_graph_anchor(&graph).await {
+            Err(GASPError::AnchorWalkHeld(why)) => {
+                assert!(why.contains("the root BEEF could not be read"), "{why}");
+            }
+            other => panic!("held at the root BEEF: {other:?}"),
+        }
+    });
+}
+
+/// N1: the GASP walk reads a peer's node proof under the engine's configured
+/// limb (`DoorBudget::proof_from_hex`), not the fixed default.
+#[test]
+fn ibf_n1_the_budget_reads_a_path_under_its_own_limb() {
+    let _g = one_at_a_time();
+    let hex = prove_wide(coin(8), 2 * SMALL_LIMB)
+        .merkle_path
+        .clone()
+        .unwrap()
+        .to_hex();
+    assert!(DoorBudget::DEFAULT.proof_from_hex(&hex).is_ok());
+    let e = small_budget()
+        .proof_from_hex(&hex)
+        .expect_err("past the small limb");
+    assert!(beef_limits::is_proof_limb(&e), "{e}");
+    // The GASP WALK's read of a peer's node proof (`find_needed_inputs`):
+    // under the configured small limb the UTXO fails (`GASPError::Other`, the
+    // fold's N2); under the default it is read. RED with the walk reading the
+    // fixed default.
+    block_on(async {
+        let store = MemoryStorage::new();
+        let manager = AdmitZero;
+        let tx = prove_wide(coin(9), 2 * SMALL_LIMB);
+        let node = GASPNode {
+            graph_id: format!("{}.0", tx.id()),
+            raw_tx: tx.to_hex(),
+            output_index: 0,
+            proof: tx.merkle_path.as_ref().map(MerklePath::to_hex),
+            tx_metadata: None,
+            output_metadata: None,
+            inputs: None,
+        };
+        let walk = |budget: DoorBudget| {
+            OverlayGASPStorage::new(&store, TOPIC, new_finalized_graph_sink())
+                .with_topic_manager(&manager)
+                .with_walk_budget(budget)
+        };
+        match walk(small_budget()).find_needed_inputs(&node).await {
+            Err(GASPError::Other(why)) => assert!(why.contains("(the proof limb;"), "{why}"),
+            other => panic!("the walk's read fails the UTXO: {other:?}"),
+        }
+        walk(DoorBudget::DEFAULT)
+            .find_needed_inputs(&node)
+            .await
+            .expect("under the default the proof is read");
+    });
+}
+
+/// H1 (ruling 1): every production caller of the BEEF proof limb reads the
+/// house's stream-first parse next (or answers its stop and returns), never
+/// `Beef::from_binary` or `Transaction::from_beef` directly; a new caller
+/// fails this pin until it is listed. (The frame read counts every node any
+/// bsv-rs reader parses whatever `read` says, the differential above: this is
+/// the belt.)
+#[test]
+fn ibf_h1_every_caller_of_the_limb_reads_the_stream_next() {
+    let _g = one_at_a_time();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    // (file, the limb's call, the read that follows it)
+    let callers: &[(&str, &str, &str)] = &[
+        (
+            "overlay-engine/src/engine.rs",
+            "self.walk_budget.proof_limb(&tagged_beef.beef)",
+            "beef_limits::parse_beef(&tagged_beef.beef",
+        ),
+        (
+            "overlay-engine/src/engine.rs",
+            "budget.proof_limb(beef_bytes)",
+            "Engine::verify_beef_linear(",
+        ),
+        (
+            "overlay-engine/src/engine.rs",
+            "DoorBudget::DEFAULT.proof_limb(&output.beef)",
+            "beef_limits::subject_from_beef(&output.beef",
+        ),
+        (
+            "overlay-engine/src/script_door.rs",
+            "budget.proof_limb(beef_bytes)",
+            "DoorIndex::read(beef_bytes)",
+        ),
+        (
+            "overlay-engine/src/gasp_overlay.rs",
+            "self.walk_budget.proof_limb(&root_beef)",
+            "beef_limits::parse_beef(&root_beef",
+        ),
+        (
+            "overlay-cloudflare/src/mainnet_fanout.rs",
+            "WORKER_WALK_BUDGET.proof_limb(beef)",
+            "beef_limits::parse_beef(beef",
+        ),
+        (
+            "overlay-cloudflare/src/peer_crawler.rs",
+            "WORKER_WALK_BUDGET.proof_limb(&entry.beef)",
+            "beef_limits::subject_from_beef(",
+        ),
+        (
+            "overlay-cloudflare/src/routes.rs",
+            "WORKER_WALK_BUDGET\n        .proof_limb(beef)",
+            "",
+        ),
+        (
+            "overlay-cloudflare/src/queue.rs",
+            "WORKER_WALK_BUDGET\n        .proof_limb(bytes)",
+            "",
+        ),
+        (
+            "overlay-cloudflare/src/stored_rows.rs",
+            "WORKER_WALK_BUDGET.proof_limb(bytes)",
+            "beef_limits::read_beef(bytes)",
+        ),
+    ];
+    let mut per_file: std::collections::BTreeMap<&str, usize> = Default::default();
+    for (file, limb, next) in callers {
+        *per_file.entry(file).or_default() += 1;
+        let src = std::fs::read_to_string(root.join(file)).unwrap();
+        let at = src
+            .find(limb)
+            .unwrap_or_else(|| panic!("{file} reads the limb by {limb}"));
+        if next.is_empty() {
+            continue; // a helper: its callers' reads are the queue's and the route's own (pinned there)
+        }
+        let after = &src[at..];
+        let next_at = after
+            .find(next)
+            .unwrap_or_else(|| panic!("{file}: {next} follows {limb}"));
+        for direct in [
+            "Beef::from_binary(",
+            "Transaction::from_beef(",
+            "from_binary_with_limits(",
+        ] {
+            assert!(
+                !after[..next_at].contains(direct),
+                "{file}: {direct} between the limb and the stream-first read"
+            );
+        }
+    }
+    // Every production call of the limb is listed (tests cut off).
+    for (file, listed) in per_file {
+        let src = std::fs::read_to_string(root.join(file)).unwrap();
+        let prod = src.split("#[cfg(test)]\nmod ").next().unwrap();
+        let calls = prod.matches(".proof_limb(").count();
+        assert_eq!(calls, listed, "{file}: every call of the limb is listed");
     }
 }

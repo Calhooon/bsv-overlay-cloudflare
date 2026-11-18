@@ -236,24 +236,42 @@ fn lifted(manager: Naming, storage: MemoryStorage) -> Engine {
 }
 
 /// Under the DEFAULT budget the door stops the wide body at the frame, before
-/// any parse, under both policies (lane INTAKE-BOUND).
+/// any parse, under `NotNow` (lane INTAKE-BOUND); under `NetworkAccepted` it
+/// goes on past the proof limb, the trip reported (the fold's ruling 2).
 async fn stopped_at_intake(beef: &[u8], mode: SubmitMode) {
-    let engine = engine_with(
-        Naming {
-            deep: false,
-            admits: true,
-            names: true,
-        },
-        MemoryStorage::new(),
-    );
-    for policy in [WalkBreachPolicy::NotNow, WalkBreachPolicy::NetworkAccepted] {
-        let tagged = TaggedBEEF::new(beef.to_vec(), vec![TOPIC.into()]);
-        match engine.submit_with_report_under(&tagged, mode, policy).await {
-            Err(EngineError::WalkCouldNotRun(stop)) => {
-                assert_eq!(stop.limb, WalkLimb::OverProof, "{policy:?}: {}", stop.what);
-            }
-            other => panic!("{policy:?}: the proof limb stops it first: {other:?}"),
+    let engine = || {
+        engine_with(
+            Naming {
+                deep: false,
+                admits: true,
+                names: true,
+            },
+            MemoryStorage::new(),
+        )
+    };
+    let tagged = TaggedBEEF::new(beef.to_vec(), vec![TOPIC.into()]);
+    match engine()
+        .submit_with_report_under(&tagged, mode, WalkBreachPolicy::NotNow)
+        .await
+    {
+        Err(EngineError::WalkCouldNotRun(stop)) => {
+            assert_eq!(stop.limb, WalkLimb::OverProof, "NotNow: {}", stop.what);
         }
+        other => panic!("NotNow: the proof limb stops it first: {other:?}"),
+    }
+    match engine()
+        .submit_with_report_under(&tagged, mode, WalkBreachPolicy::NetworkAccepted)
+        .await
+    {
+        Ok((_, report)) => assert_eq!(
+            report.walk_could_not_run.map(|stop| stop.limb),
+            Some(WalkLimb::OverProof),
+            "NetworkAccepted: the proof trip is reported"
+        ),
+        Err(EngineError::WalkCouldNotRun(stop)) => {
+            panic!("NetworkAccepted goes on past the proof limb: {}", stop.what)
+        }
+        Err(_) => {}
     }
 }
 

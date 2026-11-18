@@ -116,10 +116,10 @@ pub const COURIER_PROOF_MAX_BYTES: usize = (8 * 1024 - 2) / 2;
 /// the same wire bound, and it stays.
 pub const PUSH_PROOF_MAX_BYTES: usize = COURIER_PROOF_MAX_BYTES;
 /// A name only since NL-6: a proof read back from a store is read whatever
-/// its length ([`proof_from_hex`]).
+/// its length ([`stored_proof_from_hex`]).
 pub const STORED_PROOF_MAX_BYTES: usize = COURIER_PROOF_MAX_BYTES;
 /// A name only since NL-6: a GASP peer's proof field is read whatever its
-/// length ([`proof_from_hex`]).
+/// length, under the proof limb ([`proof_from_hex_under`]).
 pub const PEER_PROOF_MAX_BYTES: usize = COURIER_PROOF_MAX_BYTES;
 
 /// What one pass of the door learned of a BEEF it accepted.
@@ -643,24 +643,63 @@ pub fn own_bump(bytes: &[u8], txid: &str) -> Option<MerklePath> {
 }
 
 /// A courier's or a push's proof field: the wire bound is checked on the hex
-/// before the decode, then the proof is parsed. The bound is the field's
-/// (see [`COURIER_PROOF_MAX_BYTES`]), not a verdict on a BEEF.
+/// before the decode, then the proof is read as a stranger's
+/// ([`proof_from_hex`]). The bound is the field's (see
+/// [`COURIER_PROOF_MAX_BYTES`]), not a verdict on a BEEF. Under that bound a
+/// path holds fewer than 2,048 nodes (two bytes a node at the least), far
+/// under the proof limb, and the frame read refuses only bytes bsv-rs refuses:
+/// so for every field under the bound the answer is `main`'s (the reads of
+/// stored fields through this function included).
 pub fn merkle_path_from_hex(hex: &str, max_bytes: usize) -> bsv_rs::Result<MerklePath> {
     check_size(hex.len(), max_bytes.saturating_mul(2), "merkle proof hex")?;
     proof_from_hex(hex)
 }
 
-/// A proof read back from a store, handed by a GASP peer, or fetched from a
-/// courier or pushed (through [`merkle_path_from_hex`]): read whatever its
-/// length, refused if the bytes do not parse, and NOT parsed when its nodes
-/// are past the proof limb's default
-/// ([`LINK_ANCESTRY_PROOF_NODES_MAX`], counted from the path's frame by
-/// `stream_sizing::path_proof_limb` before its root is computed; lane
-/// INTAKE-BOUND): `Err(BeefResourceLimit)` with the stop's words.
+/// A proof a STRANGER supplied (a GASP peer's node proof, a deferred graph's
+/// record of one, a courier's or a push's field through
+/// [`merkle_path_from_hex`]), read under the proof limb's default
+/// ([`LINK_ANCESTRY_PROOF_NODES_MAX`]): [`proof_from_hex_under`].
 pub fn proof_from_hex(hex: &str) -> bsv_rs::Result<MerklePath> {
+    proof_from_hex_under(hex, LINK_ANCESTRY_PROOF_NODES_MAX)
+}
+
+/// The words of a path the frame read does not follow ([`proof_from_hex_under`]).
+pub const PROOF_NOT_FOLLOWED_WORDS: &str =
+    "not read: not a merkle path this host's frame read follows";
+
+/// A stranger's proof field under a proof limb of `max_proof_nodes` (lane
+/// INTAKE-BOUND; the fold's H1). Its nodes are counted from the path's frame
+/// before its root is computed (`stream_sizing::path_proof_limb`, which reads
+/// a leaf's flag byte as bsv-rs's `MerklePath::from_reader` reads it):
+///
+/// - past the limb: `Err(BeefResourceLimit)` with the stop's words
+///   ([`is_proof_limb`]), nothing parsed;
+/// - bytes the frame read does not follow to the path's end: refused
+///   unparsed, `Err(BeefError)` ([`PROOF_NOT_FOLLOWED_WORDS`]), a parse
+///   refusal and never the limb's stop. bsv-rs refuses every such byte
+///   string too (the frame read follows its path grammar; the pin
+///   `ibf_h1_the_frame_read_never_counts_fewer_nodes_than_the_sdk`), so no
+///   bytes bsv-rs would parse are refused here: only the words differ;
+/// - otherwise bsv-rs's parse, as on `main`.
+pub fn proof_from_hex_under(hex: &str, max_proof_nodes: u64) -> bsv_rs::Result<MerklePath> {
     let bytes = bsv_rs::primitives::from_hex(hex)?;
-    crate::stream_sizing::path_proof_limb(&bytes, LINK_ANCESTRY_PROOF_NODES_MAX)
-        .map_err(|stop| bsv_rs::Error::BeefResourceLimit(stop.to_string()))?;
+    match crate::stream_sizing::path_proof_limb(&bytes, max_proof_nodes) {
+        Err(stop) => Err(bsv_rs::Error::BeefResourceLimit(stop.to_string())),
+        Ok(frame) if !frame.read => Err(bsv_rs::Error::BeefError(
+            PROOF_NOT_FOLLOWED_WORDS.to_string(),
+        )),
+        Ok(_) => MerklePath::from_binary(&bytes),
+    }
+}
+
+/// A proof THIS SERVICE stored (the reorg sweep's reads of a stored own bump,
+/// a verified proof the ladder handed back, the stored-rows reader's stored
+/// bodies): read whatever its length, refused only if the bytes do not parse,
+/// exactly as on `main`. The proof limb is for bytes a stranger supplied
+/// (the fold's M2): a limb stop here would turn "could not read" into a
+/// verdict on this service's own row.
+pub fn stored_proof_from_hex(hex: &str) -> bsv_rs::Result<MerklePath> {
+    let bytes = bsv_rs::primitives::from_hex(hex)?;
     MerklePath::from_binary(&bytes)
 }
 

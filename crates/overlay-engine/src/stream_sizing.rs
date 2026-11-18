@@ -151,6 +151,7 @@ pub fn estimate(body: &[u8], charges: &StreamCharges, limit: u64) -> StreamEstim
         proof_nodes: 0,
         proof_limit: u64::MAX,
         proof_over_at: None,
+        sdk_flags: false,
     };
     let followed = sizer.frame().is_some();
     StreamEstimate {
@@ -175,6 +176,15 @@ struct Sizer<'a> {
     proof_limit: u64,
     /// The BUMP whose node took the count past `proof_limit`.
     proof_over_at: Option<usize>,
+    /// Read a BUMP leaf's flag byte as bsv-rs's path reader reads it
+    /// (`MerklePath::from_reader`: bit 0 a duplicate with no hash, any other
+    /// byte a 32-byte hash, the other bits ignored), not as the streaming
+    /// reader does (0, 1 or 2, every other byte refused). The proof limb's
+    /// reads ([`proof_limb`], [`path_proof_limb`]) take it, so they count
+    /// every node any bsv-rs reader of the bytes would parse (lane
+    /// INTAKE-BOUND-FOLD, H1); the memory estimate keeps the stream's rule
+    /// (its frame is the stream's).
+    sdk_flags: bool,
 }
 
 impl Sizer<'_> {
@@ -240,13 +250,25 @@ impl Sizer<'_> {
         for level in 0..levels {
             for _ in 0..self.f.varint()? {
                 self.f.varint()?;
-                let hashed = match *self.f.take(1)?.first()? {
-                    1 => false,
-                    0 | 2 => {
+                let flag = *self.f.take(1)?.first()?;
+                let hashed = if self.sdk_flags {
+                    // bsv-rs 0.8.13 `merkle_path.rs:278-296`: `flags & 1` a
+                    // duplicate, else a hash, whatever the other bits.
+                    if flag & 1 != 0 {
+                        false
+                    } else {
                         self.f.take(32)?;
                         true
                     }
-                    _ => return None,
+                } else {
+                    match flag {
+                        1 => false,
+                        0 | 2 => {
+                            self.f.take(32)?;
+                            true
+                        }
+                        _ => return None,
+                    }
                 };
                 leaves += 1;
                 self.proof_nodes += 1;
@@ -313,10 +335,18 @@ pub struct ProofFrame {
     /// The BUMP nodes the frame carries (a leaf at any level, hashed or
     /// not), all of them when `read`.
     pub nodes: u64,
-    /// The frame was followed to its end. `false`: the bytes are not a BEEF
-    /// frame the sizing read follows, and `nodes` is what came before; the
-    /// caller's own parse refuses such bytes (the pin
-    /// `e585f_l3_the_sizing_follows_every_frame_the_stream_reads`).
+    /// The frame was followed to its end. `false`: the bytes are not a frame
+    /// this read follows, and `nodes` is what came before. For a BEEF every
+    /// BUMP precedes the first transaction and the BUMPs are read by bsv-rs's
+    /// own path grammar here, so `nodes` already counts every node any bsv-rs
+    /// reader of the bytes (the stream, `Beef::from_binary`,
+    /// `Transaction::from_beef`) parses before it reaches the transactions:
+    /// `false` there only says the transactions' frame was not followed, and
+    /// every production caller's next read is the house's stream-first parse,
+    /// which refuses such bytes (the pin
+    /// `e585f_l3_the_sizing_follows_every_frame_the_stream_reads`; the
+    /// callers' pin `ibf_h1_every_caller_of_the_limb_reads_the_stream_next`).
+    /// For one path ([`path_proof_limb`]) `false` is a refusal.
     pub read: bool,
 }
 
@@ -345,7 +375,9 @@ impl std::fmt::Display for ProofLimbStop {
             f,
             "the body's merkle paths carry more than {} nodes (the proof limb; counted {} by the \
              BUMP at byte {}): nothing of it was read; present the same transactions with merkle \
-             paths that carry only the nodes they need",
+             paths that carry only the nodes they need, or, where every node is needed, the subject \
+             proven after its block (it then carries one path) or fewer proven parents spent by one \
+             transaction",
             self.bound, self.nodes, self.at
         )
     }
@@ -380,6 +412,7 @@ pub fn proof_limb(body: &[u8], max_proof_nodes: u64) -> Result<ProofFrame, Proof
         proof_nodes: 0,
         proof_limit: max_proof_nodes,
         proof_over_at: None,
+        sdk_flags: true,
     };
     let followed = sizer.frame().is_some();
     match sizer.proof_over_at {
@@ -397,10 +430,15 @@ pub fn proof_limb(body: &[u8], max_proof_nodes: u64) -> Result<ProofFrame, Proof
 }
 
 /// [`proof_limb`] over ONE merkle path's bytes (BRC-74, a proof field of a
-/// courier, a push or a GASP peer): its node count, or the stop. Bytes that
-/// are not a whole path are `Ok` with what came before (the caller's parse
-/// refuses them).
-pub fn path_proof_limb(path: &[u8], max_proof_nodes: u64) -> Result<u64, ProofLimbStop> {
+/// courier, a push or a GASP peer): its node count, or the stop. `read`:
+/// the path was followed to its end, its leaves' flag bytes read as bsv-rs's
+/// path reader reads them, its varints canonical (as bsv-rs reads them). Bytes
+/// it does NOT follow are not a merkle path this host reads: the caller
+/// refuses them unparsed (`beef_limits::proof_from_hex_under`), never hands
+/// them to bsv-rs (lane INTAKE-BOUND-FOLD, H1: a reader that pays must never
+/// count more nodes than this one did). Trailing bytes after a whole path are
+/// not read here, nor by bsv-rs's `MerklePath::from_binary`.
+pub fn path_proof_limb(path: &[u8], max_proof_nodes: u64) -> Result<ProofFrame, ProofLimbStop> {
     let mut sizer = Sizer {
         f: Fields { raw: path, at: 0 },
         charges: &StreamCharges::NOTHING,
@@ -411,8 +449,9 @@ pub fn path_proof_limb(path: &[u8], max_proof_nodes: u64) -> Result<u64, ProofLi
         proof_nodes: 0,
         proof_limit: max_proof_nodes,
         proof_over_at: None,
+        sdk_flags: true,
     };
-    let _ = sizer.bump();
+    let followed = sizer.bump().is_some();
     match sizer.proof_over_at {
         Some(at) => Err(ProofLimbStop {
             nodes: sizer.proof_nodes,
@@ -420,7 +459,10 @@ pub fn path_proof_limb(path: &[u8], max_proof_nodes: u64) -> Result<u64, ProofLi
             at,
             subject: None,
         }),
-        None => Ok(sizer.proof_nodes),
+        None => Ok(ProofFrame {
+            nodes: sizer.proof_nodes,
+            read: followed,
+        }),
     }
 }
 

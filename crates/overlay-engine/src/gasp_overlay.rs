@@ -246,8 +246,11 @@ struct AssemblyNode {
 /// Both walks keep their work on the heap (the recursion they replace used
 /// the stack, once per unproven link), and neither follows a link back into
 /// a node it is still inside.
-#[derive(Default)]
 struct GraphAssembly {
+    /// The proof limb a node's proof field is read under (a peer's bytes):
+    /// the engine's configured `DoorBudget::max_proof_nodes`, handed by the
+    /// storage adapter (the fold's N1); the default where none was handed.
+    max_proof_nodes: u64,
     /// By the SHA-256 of a transaction's raw bytes.
     txs: HashMap<[u8; 32], Rc<ParsedTx>>,
     /// The transaction of each node key asked for.
@@ -258,7 +261,24 @@ struct GraphAssembly {
     checked: HashSet<(String, bool)>,
 }
 
+impl Default for GraphAssembly {
+    fn default() -> Self {
+        Self::under(crate::engine::DoorBudget::DEFAULT.max_proof_nodes)
+    }
+}
+
 impl GraphAssembly {
+    /// An empty assembly whose node proofs are read under `max_proof_nodes`.
+    fn under(max_proof_nodes: u64) -> Self {
+        GraphAssembly {
+            max_proof_nodes,
+            txs: HashMap::new(),
+            parsed: HashMap::new(),
+            nodes: HashMap::new(),
+            checked: HashSet::new(),
+        }
+    }
+
     /// The transaction of the node `key`, parsed once per graph.
     fn parsed_tx(
         &mut self,
@@ -301,16 +321,20 @@ impl GraphAssembly {
             .get(key)
             .and_then(|pending| pending.node.proof.as_ref())
         {
-            Some(proof_hex) => Some(beef_limits::proof_from_hex(proof_hex).map_err(|e| {
-                // lane INTAKE-BOUND: a path past the proof limb is not read; the anchor HOLDS the graph.
-                if beef_limits::is_proof_limb(&e) {
-                    GASPError::AnchorWalkHeld(format!(
+            Some(proof_hex) => Some(
+                beef_limits::proof_from_hex_under(proof_hex, self.max_proof_nodes).map_err(
+                    |e| {
+                        // lane INTAKE-BOUND: a path past the proof limb is not read; the anchor HOLDS the graph.
+                        if beef_limits::is_proof_limb(&e) {
+                            GASPError::AnchorWalkHeld(format!(
                         "the proof of {key} could not be read within the budget (over_proof: {e})"
                     ))
-                } else {
-                    GASPError::Other(format!("Failed to parse proof for {key}: {e}"))
-                }
-            })?),
+                        } else {
+                            GASPError::Other(format!("Failed to parse proof for {key}: {e}"))
+                        }
+                    },
+                )?,
+            ),
             None => None,
         };
         // A proven node is a leaf. An unproven one takes each input's source
@@ -664,13 +688,14 @@ impl<'a> OverlayGASPStorage<'a> {
         refs: &HashMap<String, PendingNode>,
         strict_beef: bool,
         anchored: Option<AnchoredGraph>,
+        max_proof_nodes: u64,
     ) -> Result<Vec<Vec<u8>>, GASPError> {
         let (order, assembly) = match anchored {
             Some(kept) if kept.graph_id == graph_id && kept.strict_beef == strict_beef => {
                 (kept.order, kept.assembly)
             }
             _ => {
-                let mut assembly = GraphAssembly::default();
+                let mut assembly = GraphAssembly::under(max_proof_nodes);
                 let order = Self::ordered_keys(graph_id, refs);
                 for key in &order {
                     assembly.check(key, refs, strict_beef)?;
@@ -704,6 +729,7 @@ impl<'a> OverlayGASPStorage<'a> {
         graph_id: &str,
         refs: &HashMap<String, PendingNode>,
         strict_beef: bool,
+        max_proof_nodes: u64,
     ) -> Result<AnchorInput, GASPError> {
         let unassembled = |e: GASPError| match e {
             // lane INTAKE-BOUND: a node's proof past the proof limb is a HOLD, never "unavailable".
@@ -718,7 +744,7 @@ impl<'a> OverlayGASPStorage<'a> {
             )));
         }
 
-        let mut assembly = GraphAssembly::default();
+        let mut assembly = GraphAssembly::under(max_proof_nodes);
         let mut absent_sources: Vec<(String, u32)> = Vec::new();
         let mut visited: HashSet<&str> = HashSet::new();
         // (node key, whether a path of UNPROVEN nodes leads from the root to it)
@@ -993,8 +1019,12 @@ impl GASPStorage for OverlayGASPStorage<'_> {
             };
             let mut tx = Transaction::from_hex(&node.raw_tx)
                 .map_err(|e| GASPError::Other(format!("Failed to parse raw_tx: {e}")))?;
+            // A peer's node proof under the engine's proof limb (the fold's
+            // N1); past it or unfollowed: the UTXO fails (`GASPError::Other`,
+            // the fold's N2), no record kept.
             tx.merkle_path = Some(
-                beef_limits::proof_from_hex(proof_hex)
+                self.walk_budget
+                    .proof_from_hex(proof_hex)
                     .map_err(|e| GASPError::Other(format!("Failed to parse proof: {e}")))?,
             );
 
@@ -1358,7 +1388,12 @@ impl GASPStorage for OverlayGASPStorage<'_> {
                 .pending_graphs
                 .lock()
                 .map_err(|e| GASPError::Other(format!("Lock poisoned: {e}")))?;
-            Self::read_anchor_input(graph_id, &refs, self.strict_beef)?
+            Self::read_anchor_input(
+                graph_id,
+                &refs,
+                self.strict_beef,
+                self.walk_budget.max_proof_nodes,
+            )?
         };
         let unavailable =
             |what: String| GASPError::AnchorUnavailable(format!("graph {graph_id}: {what}"));
@@ -1567,8 +1602,13 @@ impl GASPStorage for OverlayGASPStorage<'_> {
         debug!("Finalizing graph {graph_id} ({node_count} nodes). Computing ordered BEEFs.");
 
         // Compute ordered BEEFs for the graph.
-        let beefs =
-            Self::compute_ordered_beefs(graph_id, &refs, self.strict_beef, self.take_anchored())?;
+        let beefs = Self::compute_ordered_beefs(
+            graph_id,
+            &refs,
+            self.strict_beef,
+            self.take_anchored(),
+            self.walk_budget.max_proof_nodes,
+        )?;
 
         // Push to shared sink for later Engine submission.
         drop(refs);
@@ -2689,9 +2729,14 @@ mod tests {
                 }
                 let legacy = legacy_compute_ordered_beefs(&root_key, &refs, strict)
                     .map_err(|e| e.to_string());
-                let ours =
-                    OverlayGASPStorage::compute_ordered_beefs(&root_key, &refs, strict, None)
-                        .map_err(|e| e.to_string());
+                let ours = OverlayGASPStorage::compute_ordered_beefs(
+                    &root_key,
+                    &refs,
+                    strict,
+                    None,
+                    crate::engine::DoorBudget::DEFAULT.max_proof_nodes,
+                )
+                .map_err(|e| e.to_string());
                 assert_eq!(ours, legacy, "graph {root_key}, strict {strict}");
             }
         }
@@ -2790,8 +2835,14 @@ mod tests {
         assembly.check(&root_key, &refs, true).unwrap();
         let beef = Beef::from_binary(&assembly.beef_of(&root_key)).unwrap();
         assert_eq!(beef.txs.len(), 2);
-        let beefs =
-            OverlayGASPStorage::compute_ordered_beefs(&root_key, &refs, true, None).unwrap();
+        let beefs = OverlayGASPStorage::compute_ordered_beefs(
+            &root_key,
+            &refs,
+            true,
+            None,
+            crate::engine::DoorBudget::DEFAULT.max_proof_nodes,
+        )
+        .unwrap();
         assert_eq!(beefs.len(), 2);
     }
 }
