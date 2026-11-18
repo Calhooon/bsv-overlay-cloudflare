@@ -280,7 +280,7 @@ pub fn replay_breach_policy(msg: &MutationMessage) -> overlay_engine::engine::Wa
 /// Whether the consumer reads the proof limb over a message's bytes before its parse (the fold's M1, ruling 2): only
 /// for a message WITHOUT the gated mark, by the ONE reading of the mark ([`replay_breach_policy`]). A marked message
 /// carries bytes the network accepted, which the route's entry read under the limb before it broadcast them
-/// ([`gated_bytes_within_the_limb`] holds that for what it enqueues): it goes through to the engine, which goes on
+/// (`gated_bytes_within_the_limb` holds that for what it enqueues): it goes through to the engine, which goes on
 /// past the proof limb under `NetworkAccepted` and reports it.
 #[must_use]
 pub fn replay_reads_the_limb(msg: &MutationMessage) -> bool {
