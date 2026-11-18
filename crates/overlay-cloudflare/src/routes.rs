@@ -61,9 +61,12 @@ pub(crate) fn engine_error_status(e: &EngineError) -> u16 {
 }
 
 /// The status of the PROOF LIMB's stop at every Worker door (the route's entry on both arms, `/admin/readmit`, the
-/// ungated engine stop; lane INTAKE-BOUND-FOLD, ruling 4): 413, never 503. The same bytes are stopped at any time,
-/// and every reader of the status alone (a client's retry rule, [`crate::ef_deferred::settle`]) reads a 503 as
-/// "again"; a 4xx settles a deferred job and tells a client not to present the same bytes.
+/// ungated engine stop; lane INTAKE-BOUND-FOLD, ruling 4): 413, never 503. The same bytes are stopped at any time.
+/// A reader of the status alone that follows HTTP's classes reads it as final ([`crate::ef_deferred::settle`]:
+/// `Done`, so a deferred job settles). The house's client today classes every status but 400 and 422 as "retry"
+/// (bsv-low `app/src/lib/overlay.ts:637-641`, `classifySubmitStatus`, read at `9504d448`), so it re-presents the same bytes on its ladder, each
+/// costing this host one frame read up to the stop and nothing parsed, and fires its own direct broadcast once; the
+/// final word for a client is the body's `sameBytesWillFail` (INTAKE-BOUND-FOLD-2, the delta review's L2).
 pub const PROOF_LIMB_STATUS: u16 = 413;
 
 /// The word of a "not now" for a walk past the engine's budget (the E592 lens fold).
@@ -100,9 +103,30 @@ pub fn walk_not_now_body(stop: &overlay_engine::engine::WalkCouldNotRun) -> serd
 /// answered [`PROOF_LIMB_STATUS`] with no `Retry-After`. The remedy in `stop.what` (the stop's own words) holds for
 /// every body that reaches it: the same transactions with merkle paths that carry only the nodes they need; where
 /// every node is needed, the subject proven after its block (it then carries one path) or fewer proven parents
-/// spent by one transaction. Nothing was broadcast, admitted or queued, so a sender who needs this body broadcast
-/// takes it to a broadcaster.
+/// spent by one transaction. The message says what THIS request did (it broadcast, admitted and queued nothing),
+/// never what happened to the same bytes elsewhere, then the Worker's own advice (INTAKE-BOUND-FOLD-2, the delta
+/// review's L1 and L6).
 pub fn proof_limb_body(stop: &overlay_engine::engine::WalkCouldNotRun) -> serde_json::Value {
+    proof_limb_body_of(stop, false)
+}
+
+/// The sentence a deferred job's RESUMED run adds when an earlier run of the same job already posted its subject
+/// ([`crate::ef_deferred::WorkBudget::resumed_mid_walk`]: NL-6d's corroboration runs after the arm's first POST):
+/// such a job was put at rest before the proof limb was in force, and its next run meets the entry's stop.
+pub const PROOF_LIMB_EARLIER_RUN_WORDS: &str =
+    "an earlier run of this job posted its subject before this bound was in force; this host has not admitted it";
+
+/// PURE: [`proof_limb_body`], and for a deferred job's resumed run whose earlier run already posted its subject
+/// (`earlier_run_posted`), the sentence [`PROOF_LIMB_EARLIER_RUN_WORDS`] before the Worker's advice.
+pub fn proof_limb_body_of(
+    stop: &overlay_engine::engine::WalkCouldNotRun,
+    earlier_run_posted: bool,
+) -> serde_json::Value {
+    let earlier = if earlier_run_posted {
+        format!("; {PROOF_LIMB_EARLIER_RUN_WORDS}")
+    } else {
+        String::new()
+    };
     serde_json::json!({
         "status": "error",
         "code": WALK_NOT_NOW_CODE,
@@ -110,8 +134,8 @@ pub fn proof_limb_body(stop: &overlay_engine::engine::WalkCouldNotRun) -> serde_
         "retryable": false,
         "sameBytesWillFail": true,
         "message": format!(
-            "the body was not read: {}; nothing was broadcast, admitted or queued, so a sender who needs this body \
-             broadcast takes it to a broadcaster",
+            "the body was not read: {}; this request broadcast, admitted and queued nothing{earlier}; a sender who \
+             needs this body broadcast takes it to a broadcaster",
             stop.what
         ),
     })
@@ -1198,8 +1222,9 @@ async fn submit_parts(
     // ── THE PROOF LIMB at the route's entry (lane INTAKE-BOUND) ──
     // Before ANY parse of the body on either arm: the ungated census, the gated arm's
     // `ef::missing_source_txids`, the subject's log line, the EF conversion, the door's stream and the engine's
-    // own parses each compute every merkle path's root again. Read from the frame alone; nothing broadcast,
-    // admitted or queued. NEW on the gated arm: for its two other limbs it goes on and the network judges; for this
+    // own parses each compute every merkle path's root again. Read from the frame alone; this request broadcasts,
+    // admits and queues nothing (a deferred job's resumed run past its first leg says an earlier run posted its
+    // subject: `budget.resumed_mid_walk()`). NEW on the gated arm: for its two other limbs it goes on and the network judges; for this
     // limb going on IS the cost. A refusal of the operator check above answers first (it reads no body).
     if let Some(stop) = intake_proof_answer(&action, &tagged_beef.beef) {
         counters.reason(SubmitReason::WalkOverProof);
@@ -1208,7 +1233,10 @@ async fn submit_parts(
             "POST /submit -> {PROOF_LIMB_STATUS} (walk-could-not-run, over_proof at intake; the body was not read): {}",
             stop.what
         );
-        return json_response(&proof_limb_body(&stop), PROOF_LIMB_STATUS);
+        return json_response(
+            &proof_limb_body_of(&stop, budget.resumed_mid_walk()),
+            PROOF_LIMB_STATUS,
+        );
     }
     // ── #371 SEEN corroboration flag — the UNGATED arm's latch feed. ──
     // Read from the SAME `action` value the exhaustive match below consumes

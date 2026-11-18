@@ -680,9 +680,13 @@ mod twin {
         let q = code(include_str!("queue.rs"));
         let start = q.find("pub async fn enqueue_replay(").unwrap();
         let f = &q[start..start + q[start..].find("\n}\n").unwrap()];
-        // the E592 fold: the producer plans the marked or unmarked message (`plan_replay` is the unmarked one)
-        assert!(f.contains(
-            "plan_replay_gated(beef, topics, mode, REPLAY_REASON_PHASE3_FAULT, room, gated)"
+        // the E592 fold: the producer plans the marked or unmarked message (`plan_replay` is the unmarked one);
+        // INTAKE-BOUND-FOLD-2: through the pure `plan_enqueue`, which reads the proof limb for a marked one.
+        assert!(f.contains("let carriage = plan_enqueue(beef, topics, mode, room, gated)?;"));
+        let plan = &q[q.find("pub(crate) fn plan_enqueue(").unwrap()..start];
+        let plan: String = plan.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(plan.contains(
+            "plan_replay_gated( beef, topics, mode, REPLAY_REASON_PHASE3_FAULT, room, gated, ))"
         ));
         assert!(!f.contains("max_bytes") && !q.contains("too large for the mutation queue"));
         assert!(include_str!("routes.rs").contains(r#"h.set("X-Overlay-Mutation", "queued")"#));

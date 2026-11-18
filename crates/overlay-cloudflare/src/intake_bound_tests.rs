@@ -150,10 +150,16 @@ fn ib_w_the_routes_stop_and_its_answer() {
             "limb": "over_proof",
             "retryable": false,
             "sameBytesWillFail": true,
-            "message": "the body was not read: W; nothing was broadcast, admitted or queued, so a sender who needs \
-                        this body broadcast takes it to a broadcaster",
+            "message": "the body was not read: W; this request broadcast, admitted and queued nothing; a sender who \
+                        needs this body broadcast takes it to a broadcaster",
         })
     );
+    // INTAKE-BOUND-FOLD-2 (the delta review's L1 and L6): the message says
+    // what THIS request did, never "nothing was broadcast".
+    assert!(!crate::routes::proof_limb_body(&frozen)["message"]
+        .as_str()
+        .unwrap()
+        .contains("nothing was broadcast"));
     assert_eq!(crate::routes::PROOF_LIMB_STATUS, 413);
     assert_eq!(crate::routes::walk_could_not_run_status(&frozen), 413);
     assert_eq!(
@@ -175,6 +181,45 @@ fn ib_w_the_routes_stop_and_its_answer() {
     assert_eq!(
         crate::routes::engine_error_status(&EngineError::WalkCouldNotRun(other)),
         503
+    );
+}
+
+/// INTAKE-BOUND-FOLD-2 (the delta review's L1): a deferred job's RESUMED run
+/// whose earlier run already posted its subject (`from_leg` past 0) says so
+/// in the answer it stores, and a run at `from_leg` 0 (and the request) says
+/// only what this request did. The entry passes `budget.resumed_mid_walk()`
+/// (`ib_w_the_route_stops_before_any_parse`). RED with the sentence dropped.
+#[test]
+fn ibf2_l1_a_resumed_run_says_an_earlier_run_posted_its_subject() {
+    use crate::ef_deferred::WorkBudget;
+    let stop = crate::routes::intake_proof_stop(&valid_past(5)).expect("stopped");
+    let message = |budget: WorkBudget| {
+        crate::routes::proof_limb_body_of(&stop, budget.resumed_mid_walk())["message"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    for (budget, earlier) in [
+        (WorkBudget::InRequest, false),
+        (WorkBudget::Resumed { from_leg: 0 }, false),
+        (WorkBudget::Resumed { from_leg: 1 }, true),
+        (WorkBudget::Resumed { from_leg: 288 }, true),
+    ] {
+        let m = message(budget);
+        assert!(
+            m.contains("this request broadcast, admitted and queued nothing"),
+            "{budget:?}: {m}"
+        );
+        assert_eq!(
+            m.contains(crate::routes::PROOF_LIMB_EARLIER_RUN_WORDS),
+            earlier,
+            "{budget:?}: {m}"
+        );
+        assert!(!m.contains("nothing was broadcast"), "{budget:?}: {m}");
+    }
+    assert_eq!(
+        crate::routes::proof_limb_body_of(&stop, false),
+        crate::routes::proof_limb_body(&stop)
     );
 }
 
@@ -245,7 +290,9 @@ fn ib_w_the_route_stops_before_any_parse() {
     assert!(arm.contains("SubmitReason::WalkOverProof"), "{arm}");
     assert!(arm.contains("COUNTER_SUBMIT_INTAKE_OVER_PROOF"), "{arm}");
     assert!(
-        arm.contains("return json_response(&proof_limb_body(&stop), PROOF_LIMB_STATUS);"),
+        arm.contains(
+            "return json_response(\n            &proof_limb_body_of(&stop, budget.resumed_mid_walk()),\n            PROOF_LIMB_STATUS,\n        );"
+        ),
         "{arm}"
     );
     let not_now = src.find("async fn walk_not_now(").unwrap();
@@ -385,12 +432,56 @@ fn ibf_w_m1_the_gated_arm_never_marks_bytes_past_the_limb() {
     let e = crate::queue::gated_bytes_within_the_limb(&past).expect_err("refused");
     assert!(e.contains("(the proof limb;"), "{e}");
     assert!(crate::queue::gated_bytes_within_the_limb(&small_body()).is_ok());
+    // INTAKE-BOUND-FOLD-2 (the delta review's L3): both belts by BEHAVIOUR.
+    // The enqueue's plan (`plan_enqueue`, the one pure function
+    // `enqueue_replay` sends from): a MARKED message of a VALID body past the
+    // limb is never planned, one under it is planned marked, an unmarked one
+    // is planned as before. RED with the check inert, or run over another
+    // body (the delta's D8b).
+    let topics = vec!["tm_a".to_string()];
+    let mode = overlay_engine::types::SubmitMode::HistoricalTx;
+    let room = crate::queue::QUEUE_MESSAGE_ROOM;
+    let e = crate::queue::plan_enqueue(&past, &topics, mode, room, true)
+        .err()
+        .expect("a marked message past the limb is never planned");
+    assert!(e.contains("(the proof limb;"), "{e}");
+    for (body, gated) in [
+        (&small_body(), true),
+        (&small_body(), false),
+        (&past, false),
+    ] {
+        let planned = crate::queue::plan_enqueue(body, &topics, mode, room, gated)
+            .unwrap_or_else(|e| panic!("gated {gated}: planned: {e}"));
+        assert_eq!(planned.message().gated, gated);
+    }
+    // The job's stream at rest (`at_rest_stream`, the one pure function
+    // `put_at_rest` reads its bytes through): refused for a VALID body past
+    // the limb; under it, the BEEF then the off-chain values. RED with the
+    // check inert (the delta's D7).
+    let tagged = |beef: Vec<u8>| overlay_engine::types::TaggedBEEF {
+        beef,
+        topics: topics.clone(),
+        off_chain_values: Some(vec![9, 8, 7]),
+    };
+    let e = crate::ef_deferred::at_rest_stream(&tagged(past.clone()))
+        .err()
+        .expect("a job past the limb is never put at rest");
+    assert!(e.contains("(the proof limb;"), "{e}");
+    let small = tagged(small_body());
+    let stream = crate::ef_deferred::at_rest_stream(&small).expect("under the limb");
+    let mut whole = small_body();
+    whole.extend([9, 8, 7]);
+    assert_eq!(stream.total(), whole.len());
+    assert_eq!(stream.span(0, stream.total()), whole);
+    // ... and each door calls the pure function and nothing else.
     let queue = source("queue.rs");
     let f = queue.find("pub async fn enqueue_replay(").unwrap();
-    assert!(queue[f..f + 600].contains("if gated {\n        gated_bytes_within_the_limb(beef)?;"));
+    assert!(queue[f..f + 600]
+        .contains("let carriage = plan_enqueue(beef, topics, mode, room, gated)?;"));
+    assert!(!queue[f..f + 600].contains("plan_replay_gated("));
     let ef = source("ef_deferred.rs");
     let f = ef.find("async fn put_at_rest(").unwrap();
-    assert!(ef[f..f + 800].contains("crate::queue::gated_bytes_within_the_limb(&tagged.beef)?;"));
+    assert!(ef[f..f + 800].contains("let stream = at_rest_stream(tagged)?;"));
     // Completion adds no node; the strip removes the subject's.
     let nodes = |b: &[u8]| {
         crate::WORKER_WALK_BUDGET
@@ -435,6 +526,19 @@ fn ib_w_the_reason_and_the_counters() {
     );
     assert!(crate::submit_counters::all_names()
         .contains(&"submit_answer_reason_walk_over_proof_total".to_string()));
+    // INTAKE-BOUND-FOLD-2 (the delta review's L7): the limb's status row is
+    // served from 0 too. RED with 413 out of `all_names` (the delta's D14).
+    let [status_row, reason_row] = crate::submit_counters::counter_names(
+        crate::routes::PROOF_LIMB_STATUS,
+        crate::submit_counters::Reason::WalkOverProof,
+    );
+    assert_eq!(status_row, "submit_answer_413_total");
+    for row in [&status_row, &reason_row] {
+        assert!(
+            crate::submit_counters::all_names().contains(row),
+            "{row} served from 0"
+        );
+    }
     assert_eq!(
         crate::ops::engine_walk_over_counter(WalkLimb::OverProof),
         crate::ops::COUNTER_SUBMIT_ENGINE_WALK_OVER_PROOF
