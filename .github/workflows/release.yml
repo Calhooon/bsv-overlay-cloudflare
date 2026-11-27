@@ -16,15 +16,30 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
-      - name: Check version and main ancestry
+      # Two forms of tag and no other (RELEASING.md, "The two lines and the direction rule"):
+      # vX.Y.Z, a stable release, cut from main; vX.Y.Z-beta.N, a prerelease, cut from beta.
+      # Any other form (-rc.1, -alpha, a build suffix) is refused before anything is published.
+      - name: Check the tag's form, the version and the tag's line
         run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-beta\.(0|[1-9][0-9]*))?$ ]]; then
+            if [ -n "${BASH_REMATCH[4]}" ]; then line=beta; else line=main; fi
+          else
+            echo "::error::tag ${GITHUB_REF_NAME} is neither vX.Y.Z (cut from main) nor vX.Y.Z-beta.N (cut from beta); no other form is released"
+            exit 1
+          fi
           python3 scripts/check-release-version.py
-          git fetch --no-tags origin main
-          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          git fetch --no-tags origin "+refs/heads/${line}:refs/remotes/origin/${line}"
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" "origin/${line}"; then
+            echo "::error::tag ${GITHUB_REF_NAME} is not on ${line}: a stable tag is cut from main, a prerelease tag from beta"
+            exit 1
+          fi
+          echo "tag ${GITHUB_REF_NAME} is on ${line}"
 
   # ci.yml's workflow_call runs its two jobs, lint and checks, in full (a tag
-  # is no push to main). checks reads pull requests and check runs on a push
-  # to main, so the call grants both, read only.
+  # is no push to a line; its beta-born and main-in-beta jobs read a pull request
+  # or a push to beta and do not run). checks reads pull requests and check runs
+  # on a push to a line, so the call grants both, read only.
   ci:
     needs: version
     uses: ./.github/workflows/ci.yml

@@ -16,7 +16,7 @@ export CARGO_TARGET_DIR
 ADMIN_TOKEN ?= parity-harness-token
 export ADMIN_TOKEN
 
-.PHONY: parity reference-up reference-down reference-logs ci-route ci-deploy ci-d1-budget ci-d1-board ownership app-layer-door secrets hooks \
+.PHONY: parity reference-up reference-down reference-logs ci-route ci-deploy ci-d1-budget ci-d1-board ownership app-layer-door secrets lines hooks \
         wrangler-dev harness test e2e-bsv-storage clean help
 
 help:
@@ -30,6 +30,7 @@ help:
 	@echo "  test             cargo test of BOTH workspaces (root: engine crates + harness; workers/: the LOW workers)"
 	@echo "  ci               THE GATE: tests + clippy --all-targets + both wasm32 builds + ci-deploy + ci-route"
 	@echo "  secrets          The secrets check: its self-test, the push door's test, then every tracked file for credential shapes and the vault's values (part of ci)"
+	@echo "  lines            The two lines' checks tested (scripts/tests/lines.sh over scripts/check-lines.py: beta-born, main-in-beta; part of ci)"
 	@echo "  hooks            Install the pre-push secrets door for this clone (git config core.hooksPath scripts/hooks)"
 	@echo "  ownership        The storage ownership check (bsv-low #474): every SQL statement against storage-ownership.json (part of ci)"
 	@echo "  ci-route         Route-level /submit + /arc-ingest + /requestForeignGASPNodes cells (part of ci; needs nine free ports from LANE_BASE, default :8791-:8799, and :LANE_BASE+11, +12 for NL-6c and NL-6d)"
@@ -140,6 +141,7 @@ gate-output-dirs:
 ci: gate-output-dirs
 	@set -e; \
 	$(MAKE) secrets; \
+	$(MAKE) lines; \
 	bash scripts/check-config-ids.sh --self-test; \
 	bash scripts/check-config-ids.sh; \
 	python3 scripts/check-storage-ownership.py --self-test; \
@@ -172,6 +174,12 @@ secrets:
 	@python3 scripts/check-secrets.py --self-test
 	@bash scripts/tests/pre-push-secrets.sh
 	@python3 scripts/check-secrets.py
+
+# The two lines' direction rule (RELEASING.md): scripts/check-lines.py (Python 3 stdlib only) is what ci.yml's
+# `beta-born` and `main-in-beta` jobs call; this runs its test over scratch repositories and a bare remote under
+# $$TMPDIR. Part of `ci`, after `secrets`.
+lines:
+	@bash scripts/tests/lines.sh
 
 # The pre-push door for EVERY worktree of this clone (scripts/install-hooks.sh): scripts/hooks/pre-push.common is copied
 # to the clone's common hooks folder, which git runs for every worktree whatever it has checked out, and runs the remote
