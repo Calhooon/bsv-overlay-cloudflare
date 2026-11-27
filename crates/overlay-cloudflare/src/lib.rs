@@ -199,7 +199,9 @@ fn gasp_sync_configuration(trackers: &[String]) -> overlay_engine::types::SyncCo
     for topic in ["tm_uhrp", "tm_agent", "tm_dm_delegation"] {
         config.insert(topic.to_string(), SyncTarget::Ship);
     }
-    // The LOW topics remain single-node indexes.
+    // The LOW topics remain single-node indexes. Every manager the factory
+    // can build (`WORKSPACE_TOPIC_MANAGERS`) is named in this function: a
+    // topic's sync target is never decided by omission (pins `sync_entries_*`).
     for topic in [
         "tm_low",
         "tm_reveal",
@@ -211,6 +213,7 @@ fn gasp_sync_configuration(trackers: &[String]) -> overlay_engine::types::SyncCo
         "tm_proof",
         "tm_potparty",
         "tm_potrefund",
+        "tm_hopparty",
     ] {
         config.insert(topic.to_string(), SyncTarget::Disabled);
     }
@@ -2318,7 +2321,7 @@ mod tests {
             );
             let (filtered, skipped) = registered_sync_configuration(config, &managers);
             assert_eq!(filtered.len(), 3);
-            assert_eq!(skipped.len(), 12);
+            assert_eq!(skipped.len(), 13);
             assert!(matches!(filtered[&topic], SyncTarget::Ship));
             assert!(matches!(
                 filtered[&crate::routes::suffixed_name("tm_low", suffix)],
@@ -2373,6 +2376,7 @@ mod tests {
             "tm_proof",
             "tm_potparty",
             "tm_potrefund",
+            "tm_hopparty",
         ];
         assert_eq!(config.len(), topics.len());
         for suffix in ["", "_beta"] {
