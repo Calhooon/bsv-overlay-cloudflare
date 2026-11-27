@@ -6,10 +6,14 @@
 # /workers entry, 2026-10-18, bsv-stack-lean #165), so a loop PR on the root is
 # completed by hand for workers/ (the same bsv-rs line in both, one
 # workers/Cargo.lock) before it merges; the gate's --locked legs red otherwise.
+# target-branch: every change is born on `beta` (RELEASING.md, items 11 and 18), the loop's
+# included: a bot commit landed on `main` would be a commit born there. Dependabot reads this
+# file on the default branch, so the line lives here, on `main`.
 version: 2
 updates:
   - package-ecosystem: cargo
     directory: /
+    target-branch: beta
     schedule:
       interval: cron
       cronjob: "0 18 * * *"

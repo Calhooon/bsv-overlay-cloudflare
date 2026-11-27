@@ -312,7 +312,11 @@ jobs:
   # commit of a pull request into main is on origin/beta by sha, by patch, or by the line
   # `git cherry-pick -x` writes, or is a release commit (versions and CHANGELOG.md alone). The
   # cut's own pull request has beta's tip for its head, so it has no commit left to judge.
-  # While origin has no branch `beta` the job passes and says so in one line.
+  # While origin has no branch `beta` the job passes and says so in one line, unless the marker
+  # `.github/lines` at the base says `beta born`: then a missing branch fails.
+  # The script that judges is the BASE's copy, never the pull request's own (a pull request that
+  # edits the check is judged by the check it would replace); where the base holds none (the
+  # pull request that adds it) the tree's copy runs and the step says so.
   beta-born:
     name: beta-born
     if: ${{ github.event_name == 'pull_request' && github.base_ref == 'main' }}
@@ -326,11 +330,22 @@ jobs:
       env:
         PR_BASE: ${{ github.event.pull_request.base.sha }}
         PR_HEAD: ${{ github.event.pull_request.head.sha }}
-      run: python3 scripts/check-lines.py beta-born --base "$PR_BASE" --head "$PR_HEAD"
+      run: |
+        set -euo pipefail
+        judge="$RUNNER_TEMP/check-lines.py"
+        if git cat-file -e "$PR_BASE:scripts/check-lines.py" 2>/dev/null; then
+          git show "$PR_BASE:scripts/check-lines.py" > "$judge"
+        else
+          echo "beta-born: the base $PR_BASE holds no scripts/check-lines.py: this pull request's own copy judges it"
+          cp scripts/check-lines.py "$judge"
+        fi
+        python3 "$judge" beta-born --base "$PR_BASE" --head "$PR_HEAD"
   # Nothing sits on main that beta lacks: every commit of origin/main is on the tree (a pull
   # request's merge commit, beta's tip after a push) by sha, by patch, or by a cherry-pick line
   # in either direction. Patch and link, never ancestry: main is linear and takes commits by
-  # rebase, so one change has two shas.
+  # rebase, so one change has two shas. The script that judges is the copy of the line being
+  # protected: a pull request's base, or beta as it stood before the push; where that holds none
+  # (the push that creates beta, or a base before the check) the tree's copy runs, said.
   main-in-beta:
     name: main-in-beta
     if: >-
@@ -343,4 +358,15 @@ jobs:
         fetch-depth: 0
         persist-credentials: false
     - name: every commit of main is on this tree
-      run: python3 scripts/check-lines.py main-in-beta --tree HEAD
+      env:
+        BEFORE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+      run: |
+        set -euo pipefail
+        judge="$RUNNER_TEMP/check-lines.py"
+        if [[ "$BEFORE" =~ ^[0-9a-f]{40}$ ]] && git cat-file -e "$BEFORE:scripts/check-lines.py" 2>/dev/null; then
+          git show "$BEFORE:scripts/check-lines.py" > "$judge"
+        else
+          echo "main-in-beta: beta before this change (${BEFORE:-none}) holds no scripts/check-lines.py: the tree's own copy judges it"
+          cp scripts/check-lines.py "$judge"
+        fi
+        python3 "$judge" main-in-beta --tree HEAD

@@ -39,6 +39,22 @@ born fix-1
 [ "$(wc -l < "$last" | tr -d ' ')" = 1 ] && grep -q 'beta-born: origin has no branch `beta`: the line is not born yet' "$last" \
     || fail "no beta branch is not said in the one line: $(cat "$last")"
 
+# 1b. the marker `.github/lines`, read at the BASE: `beta unborn` passes as no marker does; `beta born` with no
+#     branch `beta` on the remote is a failure (a line that was born and is missing passes nothing); any other
+#     marker is "could not run"
+git checkout -q -b marked main; mkdir -p .github
+printf '# the lines\nbeta unborn\n' > .github/lines; commit "the marker, unborn"
+run beta-born --base marked --head fix-1
+[ "$code" -eq 0 ] || fail "the marker `beta unborn` with no beta branch was refused: $(cat "$last")"
+printf '# the lines\nbeta born\n' > .github/lines; commit "the marker, born"
+run beta-born --base marked --head fix-1
+[ "$code" -eq 1 ] || fail "the marker says beta born, the branch is missing, and beta-born answered $code, not 1: $(cat "$last")"
+grep -q 'beta-born: REFUSED: .github/lines at the base says `beta born` and origin has no branch `beta`' "$last" \
+    || fail "the missing born line is not said: $(cat "$last")"
+printf 'gamma maybe\n' > .github/lines; commit "the marker, unreadable"
+run beta-born --base marked --head fix-1
+[ "$code" -eq 2 ] || fail "an unreadable marker answered $code, not 2: $(cat "$last")"
+
 # the line is born: beta is cut from main's tip
 git checkout -q -b beta main; git push -q origin beta
 
@@ -62,6 +78,50 @@ git checkout -q -b fix-2b main
 git cherry-pick "$fix_on_beta" >/dev/null
 born fix-2b
 [ "$code" -eq 0 ] || fail "a pick of the same patch was refused: $(cat "$last")"
+
+# 3b. the `-x` line is evidence for the named commit's paths only. A commit born on main that adds another file
+#     under a line naming a real beta commit is refused; so is the line QUOTED inside a sentence over a change
+#     of the named commit's own path (only a whole line is the line); so is an EMPTY commit that carries the line
+git checkout -q -b evil main
+echo evil > src/evil.rs; git add -A
+git commit -q -m "an unrelated file under a borrowed line" -m "(cherry picked from commit $fix_on_beta)"
+born evil
+[ "$code" -eq 1 ] || fail "a commit born on main passed on a line naming a beta commit that touches other paths (exit $code): $(cat "$last")"
+grep -q "beta-born: REFUSED $(short evil) an unrelated file under a borrowed line" "$last" || fail "the borrowed line's commit is not named: $(cat "$last")"
+git checkout -q -b quoted main
+printf 'one\ntwo\nthree\nfour\nFIVE\n' > src/lib.rs; git add -A
+git commit -q -m "five" -m "see also \"(cherry picked from commit $fix_on_beta)\" in passing"
+born quoted
+[ "$code" -eq 1 ] || fail "the cherry-pick line quoted inside a sentence passed a commit born on main (exit $code): $(cat "$last")"
+git checkout -q -b hollow main
+git commit -q --allow-empty -m "nothing at all" -m "(cherry picked from commit $fix_on_beta)"
+born hollow
+[ "$code" -eq 1 ] || fail "an empty commit passed on its cherry-pick line (exit $code): $(cat "$last")"
+#     the link written from beta's side is bound the same way: a beta commit of another path names a main-born
+#     commit, and that commit is refused
+git checkout -q -b named-from-beta main
+echo other > src/named.rs; commit "born on main, named by beta"
+named="$(git rev-parse HEAD)"
+git checkout -q -b beta-names beta
+echo note > src/note.rs; git add -A; git commit -q -m "a note" -m "(cherry picked from commit $named)"
+git push -q origin beta-names:beta
+born named-from-beta
+[ "$code" -eq 1 ] || fail "a commit born on main passed because a beta commit of other paths names it (exit $code): $(cat "$last")"
+git push -q -f origin beta:beta
+
+# 3c. the patch is compared verbatim: the same lines at another indentation are another patch
+git checkout -q beta
+printf 'if x:\n    a()\n' > src/tool.py; commit "tool"
+printf 'if x:\n    a()\n    c()\n' > src/tool.py; commit "tool: c inside the branch"
+git push -q origin beta
+git checkout -q -b tool-base main; git cherry-pick beta~1 >/dev/null
+git checkout -q -b outdented tool-base
+printf 'if x:\n    a()\nc()\n' > src/tool.py; commit "tool: c outside the branch"
+run beta-born --base tool-base --head outdented
+[ "$code" -eq 1 ] || fail "a whitespace-only variant of a beta patch passed as the same patch (exit $code): $(cat "$last")"
+git checkout -q -b indented tool-base; git cherry-pick beta >/dev/null
+run beta-born --base tool-base --head indented
+[ "$code" -eq 0 ] || fail "the verbatim pick of the same patch was refused: $(cat "$last")"
 
 # 4. a `-x` line naming a commit that is NOT on beta is refused
 git checkout -q -b side main
@@ -122,6 +182,11 @@ echo "beta's own shape" >> src/hot.rs; git add -A; git commit -q --amend --no-ed
 carried beta
 [ "$code" -eq 0 ] || fail "main-in-beta is red after the fix was carried with -x: $(cat "$last")"
 grep -q 'main-in-beta: every commit of origin/main .* by sha, by patch or by a cherry-pick line' "$last" || fail "green is not said: $(cat "$last")"
+#    an EMPTY commit of beta that only carries the link line carries nothing: red
+git reset -q --hard HEAD~1
+git commit -q --allow-empty -m "carry the hot fix, in name only" -m "(cherry picked from commit $hot)"
+carried beta
+[ "$code" -eq 1 ] || fail "main-in-beta is green on an empty commit that only names the fix (exit $code): $(cat "$last")"
 #    and carried by patch alone (a plain pick, as a rebase merge leaves it): green
 git reset -q --hard HEAD~1; git cherry-pick "$hot" >/dev/null
 carried beta
@@ -132,4 +197,4 @@ git remote set-url origin "$scratch/gone.git"
 born fix-1
 [ "$code" -eq 2 ] || fail "beta-born with an unreachable remote answered $code, not 2: $(cat "$last")"
 
-echo "lines-test: PASS (no beta branch passes with the one line; a commit born on main refused by sha; a hand-resolved cherry-pick -x of a beta commit passes, a same-patch pick passes; a line naming a commit beta lacks, or no commit, refused; a release commit passes and is said, one that moves a dependency refused; the cut's own pull request passes, a merge commit refused; main-in-beta green by main's own line, red on a fix beta lacks, green once carried by -x or by patch; an unreachable remote is exit 2)"
+echo "lines-test: PASS (no beta branch passes with the one line; a commit born on main refused by sha; a hand-resolved cherry-pick -x of a beta commit passes, a same-patch pick passes; a line naming a commit beta lacks, or no commit, refused; a release commit passes and is said, one that moves a dependency refused; the cut's own pull request passes, a merge commit refused; the marker read at the base: unborn passes, born with no branch fails, unreadable is exit 2; a borrowed line over other paths, a quoted line, an empty commit under a line and a beta link of other paths refused; a whitespace-only variant refused, the verbatim pick passes; main-in-beta green by main's own line, red on a fix beta lacks, green once carried by -x or by patch, red on an empty commit that only names it; an unreachable remote is exit 2)"
