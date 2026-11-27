@@ -15,14 +15,19 @@ Python 3, standard library only; every fact is read from git in the current repo
             `git cherry-pick -x` writes (the same words quoted inside a sentence are not the line), a
             commit so named is reachable from <remote>/beta, the commit is not empty, and it touches
             ONLY paths the named `beta` commit(s) touch: the pick of a `beta` commit resolved by hand,
-            whose patch differs. Inside those paths its content is not compared: a reviewer reads it;
+            whose patch differs. Inside those paths its content is not compared: a reviewer reads it.
+            A named commit counts only when the BASE does not already hold it: a commit both lines
+            hold (every commit `main` had before the birth is one) is no source of a pick, so a line
+            naming it passes nothing;
         (4) a commit of <remote>/beta that is not empty names IT by the same line (the link written
             from the other side), under the same bound on paths;
         (5) it is a RELEASE commit, main-born by nature, said in the output: it changes only the
             manifests (`Cargo.toml`, `workers/Cargo.toml`, `crates/*/Cargo.toml`), the two locks and
             `CHANGELOG.md`; every changed line of a manifest is a `version = "..."` line or an internal
             (`path = `) dependency's line carrying its version; every changed line of a lock is a
-            `version = "..."` line; and the root manifest's version is among them.
+            `version = "..."` line; an internal dependency's lines differ in the version alone (the
+            lines removed and the lines added are the same once the version is taken out); and the root
+            manifest's version is among them.
       Anything else is refused by sha and subject. A MERGE commit not reachable from <remote>/beta is
       refused too (`git cherry` does not read merges, and `main`'s history is linear).
       While <remote> has NO branch `beta`, the tracked marker `.github/lines`, read at <base> (never
@@ -33,7 +38,8 @@ Python 3, standard library only; every fact is read from git in the current repo
   check-lines.py main-in-beta [--tree HEAD] [--remote origin]
       A pull request into `beta` (on its merge commit) or a push to `beta`. Every commit of
       <remote>/main is on <tree> by (1) sha, (2) patch (verbatim), (3) its own `-x` line naming a
-      commit of the tree whose paths bound its own, or (4) a commit of the tree naming it. Under (4)
+      commit of the tree that <remote>/main does not hold, whose paths bound its own, or (4) a
+      commit of the tree naming it. Under (4)
       the naming commit must NOT be empty (a link that carries nothing carries nothing), and its
       paths are not bounded: a release commit of `main` moves versions `beta` does not share, so the
       commit of `beta` that names it carries what it says (the changelog). No release-commit exception.
@@ -51,6 +57,7 @@ import sys
 
 NAME = "check-lines"
 PICK_LINE = re.compile(r"^\(cherry picked from commit ([0-9a-f]{40})\)[ \t]*$", re.M)
+DEP_VERSION = re.compile(r'\bversion = "[^"]*"')
 MARKER = ".github/lines"
 MANIFEST = re.compile(r"^(Cargo\.toml|workers/Cargo\.toml|crates/[^/]+/Cargo\.toml)$")
 LOCKS = ("Cargo.lock", "workers/Cargo.lock")
@@ -134,11 +141,13 @@ def unplaced(line, tip, limit=None):
     return [sha for sha in wanted if mine.get(sha) not in held]
 
 
-def linked(sha, line, names_of_line, bound_both=True):
-    """Rules (3) and (4). (3): the commit names commit(s) of the line, is not empty, and touches only paths
-    they touch. (4): a commit of the line that is not empty names it; `bound_both` holds its paths too."""
+def linked(sha, line, other, names_of_line, bound_both=True):
+    """Rules (3) and (4). (3): the commit names commit(s) of the line that `other` (the line the commit is
+    on) does not hold, is not empty, and touches only paths they touch. (4): a commit of the line that is
+    not empty names it; `bound_both` holds its paths too."""
     mine = paths(sha)
-    sources = [source for source in named_sources(sha) if is_ancestor(source, line)]
+    sources = [source for source in named_sources(sha)
+               if is_ancestor(source, line) and not is_ancestor(source, other)]
     if sources and mine and mine <= set().union(*(paths(source) for source in sources)):
         return True
     namers = names_of_line.get(sha, ())
@@ -178,7 +187,8 @@ def marker_says_born(commit):
 
 
 def release_commit(sha):
-    """Rule (5): versions and the changelog alone, the root manifest's version among them."""
+    """Rule (5): versions and the changelog alone, the root manifest's version among them. An internal
+    dependency's line may move its version and nothing else on the line."""
     if git("rev-parse", "--verify", "--quiet", f"{sha}^", check=False).returncode != 0:
         return False
     files = out("diff-tree", "--no-commit-id", "--name-only", "-r", sha).splitlines()
@@ -191,14 +201,19 @@ def release_commit(sha):
         manifest = bool(MANIFEST.match(path))
         if not manifest and path not in LOCKS:
             return False
+        deps = {"-": [], "+": []}
         for row in out("diff", "-U0", f"{sha}^", sha, "--", path).splitlines():
             if row.startswith(("+++", "---")) or not row.startswith(("+", "-")):
                 continue
             text = row[1:].strip()
             if VERSION_LINE.match(text):
                 bumped = bumped or (path == "Cargo.toml" and row.startswith("+"))
-            elif not (manifest and INTERNAL_DEP_LINE.match(text)):
+            elif manifest and INTERNAL_DEP_LINE.match(text):
+                deps[row[0]].append(DEP_VERSION.sub('version = ""', text))
+            else:
                 return False
+        if sorted(deps["-"]) != sorted(deps["+"]):
+            return False
     return bumped
 
 
@@ -231,7 +246,7 @@ def beta_born(args):
     names = names_on(beta, args.head)
     missing = list(merges)
     for sha in unplaced(beta, args.head, base):
-        if linked(sha, beta, names):
+        if linked(sha, beta, args.base, names):
             continue
         if release_commit(sha):
             print(f"{NAME}: beta-born: a release commit, main-born by nature (versions and CHANGELOG.md alone): "
@@ -241,7 +256,7 @@ def beta_born(args):
     if missing:
         return refuse("beta-born", missing,
                       "of this pull request were not born on beta (no sha, no verbatim patch, no whole `-x` line "
-                      "naming a commit of beta whose paths hold this commit's, not a release commit): land each on beta through a pull request, then "
+                      "naming a commit of beta that main lacks and whose paths hold this commit's, not a release commit): land each on beta through a pull request, then "
                       "`git cherry-pick -x` it here")
     print(f"{NAME}: beta-born: every commit of {out('rev-parse', '--short', base)}.."
           f"{out('rev-parse', '--short', args.head)} is on {args.remote}/beta "
@@ -256,7 +271,7 @@ def main_in_beta(args):
         raise CouldNotRun(f"{args.remote} has no branch `main`")
     tree = out("rev-parse", "--verify", f"{args.tree}^{{commit}}")
     names = names_on(tree, main)
-    missing = [sha for sha in unplaced(tree, main) if not linked(sha, tree, names, bound_both=False)]
+    missing = [sha for sha in unplaced(tree, main) if not linked(sha, tree, main, names, bound_both=False)]
     if missing:
         return refuse("main-in-beta", missing,
                       "of main are not on this tree (no sha, no verbatim patch, no cherry-pick line either way from a "

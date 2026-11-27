@@ -109,6 +109,17 @@ born named-from-beta
 [ "$code" -eq 1 ] || fail "a commit born on main passed because a beta commit of other paths names it (exit $code): $(cat "$last")"
 git push -q -f origin beta:beta
 
+# 3b'. a line may not name a commit BOTH lines hold. Every commit main had before the birth is an ancestor of
+#      beta, so a commit born on main that edits an existing file under a line naming such a commit would
+#      pass by the named commit's paths: refused
+both="$(git rev-list --max-parents=0 main)"
+git checkout -q -b old-source main
+printf 'one\ntwo\nthree\nfour\nfive\nEVIL\n' > src/lib.rs; git add -A
+git commit -q -m "born on main under a line naming a commit both lines hold" -m "(cherry picked from commit $both)"
+born old-source
+[ "$code" -eq 1 ] || fail "a commit born on main passed on a line naming a commit both lines hold (exit $code): $(cat "$last")"
+grep -q "beta-born: REFUSED $(short old-source) born on main under a line" "$last" || fail "the commit under the old line is not named: $(cat "$last")"
+
 # 3c. the patch is compared verbatim: the same lines at another indentation are another patch
 git checkout -q beta
 printf 'if x:\n    a()\n' > src/tool.py; commit "tool"
@@ -152,6 +163,13 @@ sed -i.bak 's/c = "1"/c = "2"/' crates/a/Cargo.toml; rm -f crates/a/*.bak
 commit "0.1.1 and a dependency"
 born release-and-more
 [ "$code" -eq 1 ] || fail "a version bump that also moves a dependency passed as a release commit: $(cat "$last")"
+#    an internal dependency's line may move its version and nothing else: a release that also repoints its path
+git checkout -q -b release-and-a-path main
+sed -i.bak 's/0\.1\.0/0.1.1/' Cargo.toml workers/Cargo.toml crates/a/Cargo.toml Cargo.lock; rm -f ./*.bak ./*/*.bak ./*/*/*.bak
+sed -i.bak 's|path = "../b"|path = "../elsewhere"|' crates/a/Cargo.toml; rm -f crates/a/*.bak
+commit "0.1.1 and a path"
+born release-and-a-path
+[ "$code" -eq 1 ] || fail "a release commit that repoints an internal dependency's path passed: $(cat "$last")"
 
 # 6. the cut's own pull request (its head is beta's tip) passes: no commit is left to judge; a merge commit
 #    born on a main-bound branch is refused
@@ -191,10 +209,18 @@ carried beta
 git reset -q --hard HEAD~1; git cherry-pick "$hot" >/dev/null
 carried beta
 [ "$code" -eq 0 ] || fail "main-in-beta is red after the fix was carried by patch: $(cat "$last")"
+#    had the commit under a line naming a commit both lines hold LANDED on main, beta does not carry it: red
+git checkout -q main; echo EVIL >> src/lib.rs; git add -A
+git commit -q -m "born on main under a line naming a commit both lines hold" -m "(cherry picked from commit $both)"
+git push -q origin main
+carried beta
+[ "$code" -eq 1 ] || fail "main-in-beta is green on a main commit whose line names a commit both lines hold (exit $code): $(cat "$last")"
+grep -q "main-in-beta: REFUSED $(short main) born on main under a line" "$last" || fail "the landed commit is not named: $(cat "$last")"
+git checkout -q beta
 
 # 8. a check that cannot run is never a pass: a remote that does not answer
 git remote set-url origin "$scratch/gone.git"
 born fix-1
 [ "$code" -eq 2 ] || fail "beta-born with an unreachable remote answered $code, not 2: $(cat "$last")"
 
-echo "lines-test: PASS (no beta branch passes with the one line; a commit born on main refused by sha; a hand-resolved cherry-pick -x of a beta commit passes, a same-patch pick passes; a line naming a commit beta lacks, or no commit, refused; a release commit passes and is said, one that moves a dependency refused; the cut's own pull request passes, a merge commit refused; the marker read at the base: unborn passes, born with no branch fails, unreadable is exit 2; a borrowed line over other paths, a quoted line, an empty commit under a line and a beta link of other paths refused; a whitespace-only variant refused, the verbatim pick passes; main-in-beta green by main's own line, red on a fix beta lacks, green once carried by -x or by patch, red on an empty commit that only names it; an unreachable remote is exit 2)"
+echo "lines-test: PASS (no beta branch passes with the one line; a commit born on main refused by sha; a hand-resolved cherry-pick -x of a beta commit passes, a same-patch pick passes; a line naming a commit beta lacks, or no commit, refused; a release commit passes and is said, one that moves a dependency refused; the cut's own pull request passes, a merge commit refused; the marker read at the base: unborn passes, born with no branch fails, unreadable is exit 2; a borrowed line over other paths, a quoted line, an empty commit under a line and a beta link of other paths refused; a whitespace-only variant refused, the verbatim pick passes; main-in-beta green by main's own line, red on a fix beta lacks, green once carried by -x or by patch, red on an empty commit that only names it; a line naming a commit both lines hold refused by both checks; a release that repoints an internal dependency's path refused; an unreachable remote is exit 2)"
