@@ -1,0 +1,4 @@
+# The lines this repository keeps beside `main` (RELEASING.md, "The two lines and the direction rule"), read by
+# scripts/check-lines.py at a pull request's base. `beta unborn`: no branch `beta` is expected and its absence passes.
+# `beta born`: the branch must exist; its absence fails every pull request into `main`.
+beta unborn
