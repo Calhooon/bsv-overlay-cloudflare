@@ -1921,6 +1921,11 @@ pub mod memory {
                 .collect())
         }
     }
+
+    #[cfg(test)]
+    mod atomic_admission_tests {
+        include!("atomic_admission_tests.rs");
+    }
 }
 
 // ============================================================================
