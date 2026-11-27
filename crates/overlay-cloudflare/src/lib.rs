@@ -2397,6 +2397,99 @@ mod tests {
         );
     }
 
+    /// The `TOPIC_MANAGERS` lines of a wrangler config's text: each
+    /// uncommented `TOPIC_MANAGERS = "a,b,..."` line, as its names.
+    fn topic_manager_lines(toml: &str) -> Vec<Vec<String>> {
+        toml.lines()
+            .filter_map(|line| line.trim().strip_prefix("TOPIC_MANAGERS"))
+            .filter_map(|rest| rest.trim_start().strip_prefix('='))
+            .map(|value| {
+                value
+                    .trim()
+                    .trim_matches('"')
+                    .split(',')
+                    .map(|name| name.trim().to_string())
+                    .filter(|name| !name.is_empty())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Lane SYNC-ENTRIES, pin A (the closure): every topic manager the
+    /// factory can build has an explicit entry in `gasp_sync_configuration`,
+    /// bare and under a deployment suffix. A topic's sync target is never
+    /// decided by omission: a manager added to the factory with no sync
+    /// decision fails here.
+    #[test]
+    fn sync_entries_every_factory_manager_has_an_explicit_sync_entry() {
+        let config = gasp_sync_configuration(&ship_slap_bootstrap());
+        for name in WORKSPACE_TOPIC_MANAGERS {
+            assert!(
+                topic_manager_named(name).is_some(),
+                "{name}: the factory builds every listed manager"
+            );
+            assert!(
+                config.contains_key(name),
+                "{name}: the factory builds it and gasp_sync_configuration has no entry for it"
+            );
+            for suffix in ["", "_beta"] {
+                let rekeyed = rekey_sync_configuration(config.clone(), suffix);
+                assert!(
+                    rekeyed.contains_key(&crate::routes::suffixed_name(name, suffix)),
+                    "{name} under suffix {suffix:?}: no explicit sync entry"
+                );
+            }
+        }
+        // And the table names nothing the factory cannot build.
+        for topic in config.keys() {
+            assert!(
+                WORKSPACE_TOPIC_MANAGERS.contains(&topic.as_str()),
+                "{topic}: a sync entry for a manager the factory does not build"
+            );
+        }
+    }
+
+    /// Lane SYNC-ENTRIES, pin B (the shipped configs): every name on each
+    /// `TOPIC_MANAGERS` line of the two overlay configs has an explicit
+    /// sync entry, and every name on a `wrangler.low.toml` line other than
+    /// `tm_ship` and `tm_slap` is `Disabled`, bare and suffixed.
+    #[test]
+    fn sync_entries_every_shipped_topic_manager_has_an_explicit_sync_entry() {
+        use overlay_engine::types::SyncTarget;
+        let config = gasp_sync_configuration(&ship_slap_bootstrap());
+        let low = topic_manager_lines(include_str!("../wrangler.low.toml"));
+        let generic = topic_manager_lines(include_str!("../wrangler.toml"));
+        assert_eq!(low.len(), 2, "wrangler.low.toml: one line per render");
+        assert_eq!(generic.len(), 1, "wrangler.toml: one line");
+        for (file, lines) in [("wrangler.low.toml", &low), ("wrangler.toml", &generic)] {
+            for names in lines {
+                assert!(!names.is_empty(), "{file}: an empty TOPIC_MANAGERS line");
+                for name in names {
+                    assert!(
+                        config.contains_key(name),
+                        "{file}: {name} is registered and gasp_sync_configuration has no entry for it"
+                    );
+                }
+            }
+        }
+        for names in &low {
+            for name in names {
+                if name == "tm_ship" || name == "tm_slap" {
+                    continue;
+                }
+                for suffix in ["", "_beta"] {
+                    let rekeyed = rekey_sync_configuration(config.clone(), suffix);
+                    let key = crate::routes::suffixed_name(name, suffix);
+                    assert!(
+                        matches!(rekeyed.get(&key), Some(SyncTarget::Disabled)),
+                        "wrangler.low.toml: {key} is not Disabled: {:?}",
+                        rekeyed.get(&key)
+                    );
+                }
+            }
+        }
+    }
+
     /// Pin the set of non-GASP peers we crawl on a cron. Adding a new
     /// peer is a *policy* change — it means we trust that peer's
     /// records enough to admit them through our own tm_X validators —
