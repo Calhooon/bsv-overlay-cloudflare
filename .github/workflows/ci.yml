@@ -18,7 +18,13 @@
 # One run a change (bsv-low #1069): `pull_request` gates the PR head; the push to main of a tree
 # a green PR head already gated (strict protection plus a rebase merge give the same tree)
 # builds the cache main's PRs restore and runs no test (`checks`' `gated` step); any other push
-# to main, and the release's call, runs everything.
+# to main, and the release's call, runs everything. `beta`, the second line, is gated as `main`
+# is: a push to it is read the same way.
+#
+# Two more jobs hold the direction rule (RELEASING.md, "The two lines and the direction rule"),
+# each one call of scripts/check-lines.py: `beta-born` on a pull request into main, `main-in-beta`
+# on a pull request into beta and a push to beta. Neither runs on the release's call (a tag is
+# neither event). While the remote has no branch `beta`, `beta-born` passes and says so.
 name: ci
 'on':
   pull_request: null
@@ -27,6 +33,7 @@ name: ci
   push:
     branches:
     - main
+    - beta
 permissions:
   contents: read
 concurrency:
@@ -80,6 +87,11 @@ jobs:
         TMPDIR="$RUNNER_TEMP" bash scripts/tests/pre-push-secrets.sh
         python3 scripts/check-secrets.py --no-vault
         if [ -n "$BASE_SHA" ]; then python3 scripts/check-secrets.py --no-vault --commits "$BASE_SHA..HEAD"; fi
+    # The two lines' checks tested (scripts/tests/lines.sh): scripts/check-lines.py over scratch
+    # repositories and a bare remote, every case of beta-born and main-in-beta. `make lines`.
+    - name: lines
+      if: ${{ !cancelled() }}
+      run: TMPDIR="$RUNNER_TEMP" bash scripts/tests/lines.sh
     - id: toolchain
       uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
       with:
@@ -219,9 +231,9 @@ jobs:
         echo "${NEXTEST_SHA256}  $RUNNER_TEMP/nextest.tar.gz" | sha256sum -c -
         tar -xzf "$RUNNER_TEMP/nextest.tar.gz" -C "$HOME/.cargo/bin"
         cargo nextest --version
-    # A push to main whose tree a green PR head's `checks` already gated runs
-    # the builds (the cache main's PRs restore) and no test; no PR found, a
-    # tree that differs, or no green `checks` on its head runs everything.
+    # A push to main or beta whose tree a green PR head's `checks` already gated
+    # runs the builds (the cache that line's PRs restore) and no test; no PR found,
+    # a tree that differs, or no green `checks` on its head runs everything.
     - id: gated
       name: gated
       env:
@@ -232,14 +244,14 @@ jobs:
       run: |
         set -euo pipefail
         gated=false
-        if [ "$EVENT" = push ] && [ "$REF" = refs/heads/main ]; then
+        if [ "$EVENT" = push ] && { [ "$REF" = refs/heads/main ] || [ "$REF" = refs/heads/beta ]; }; then
           tree=$(git rev-parse 'HEAD^{tree}')
           for pr in $(gh api "repos/$GH_REPO/commits/$GITHUB_SHA/pulls" --jq '.[].number' || true); do
             head=$(gh api "repos/$GH_REPO/pulls/$pr" --jq .head.sha) || continue
             head_tree=$(gh api "repos/$GH_REPO/git/commits/$head" --jq .tree.sha) || continue
             green=$(gh api "repos/$GH_REPO/commits/$head/check-runs?check_name=checks&filter=latest" \
               --jq '[.check_runs[] | select(.conclusion == "success")] | length') || continue
-            echo "#$pr head $head: tree $head_tree, green checks $green; main's tree $tree"
+            echo "#$pr head $head: tree $head_tree, green checks $green; the pushed tree $tree"
             if [ "$head_tree" = "$tree" ] && [ "$green" -gt 0 ]; then gated=true; fi
           done
         fi
@@ -296,3 +308,39 @@ jobs:
         cargo build -p bsv-overlay-engine -p bsv-overlay-discovery --release --target wasm32-unknown-unknown --lib || status=1
         cargo build --manifest-path workers/Cargo.toml --workspace --release --target wasm32-unknown-unknown --lib || status=1
         exit "$status"
+  # Every change is born on beta (RELEASING.md, "The two lines and the direction rule"): each
+  # commit of a pull request into main is on origin/beta by sha, by patch, or by the line
+  # `git cherry-pick -x` writes, or is a release commit (versions and CHANGELOG.md alone). The
+  # cut's own pull request has beta's tip for its head, so it has no commit left to judge.
+  # While origin has no branch `beta` the job passes and says so in one line.
+  beta-born:
+    name: beta-born
+    if: ${{ github.event_name == 'pull_request' && github.base_ref == 'main' }}
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+    - name: every commit of the pull request was born on beta
+      env:
+        PR_BASE: ${{ github.event.pull_request.base.sha }}
+        PR_HEAD: ${{ github.event.pull_request.head.sha }}
+      run: python3 scripts/check-lines.py beta-born --base "$PR_BASE" --head "$PR_HEAD"
+  # Nothing sits on main that beta lacks: every commit of origin/main is on the tree (a pull
+  # request's merge commit, beta's tip after a push) by sha, by patch, or by a cherry-pick line
+  # in either direction. Patch and link, never ancestry: main is linear and takes commits by
+  # rebase, so one change has two shas.
+  main-in-beta:
+    name: main-in-beta
+    if: >-
+      ${{ (github.event_name == 'pull_request' && github.base_ref == 'beta') ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/beta') }}
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+    - name: every commit of main is on this tree
+      run: python3 scripts/check-lines.py main-in-beta --tree HEAD
