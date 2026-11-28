@@ -228,10 +228,7 @@ fn engine_with(manager: Naming, storage: MemoryStorage) -> Engine {
 fn lifted(manager: Naming, storage: MemoryStorage) -> Engine {
     EngineBuilder::new(Box::new(storage))
         .with_topic(TOPIC, Box::new(manager))
-        .with_walk_budget(DoorBudget {
-            max_proof_nodes: u64::MAX,
-            ..DoorBudget::DEFAULT
-        })
+        .with_walk_budget(DoorBudget::DEFAULT.with_max_proof_nodes(u64::MAX))
         .build()
 }
 

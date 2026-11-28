@@ -537,6 +537,9 @@ pub fn mutation_ack(durable: bool, enqueue: Option<Result<(), String>>) -> Mutat
 }
 
 /// Why a replay's bytes could not be read from R2. Each is the replay's FAULT (class `fault`), never "not now".
+/// NON-EXHAUSTIVE: a later release may add a fault; a `match` outside this crate carries a wildcard arm, and a fault
+/// it does not know is the replay's fault ([`BlobFault::says`]), never bytes to replay.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlobFault {
     /// The bucket holds no object under the key.
@@ -686,6 +689,9 @@ impl ReplayBytes for WorkerBytes<'_> {
 }
 
 /// What the main consumer does with a message before its replay.
+/// NON-EXHAUSTIVE: a later release may add a step; a `match` outside this crate carries a wildcard arm, and a step
+/// it does not know is never bytes to replay.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadStep {
     /// The bytes to replay (inline, or the R2 object read and checked).

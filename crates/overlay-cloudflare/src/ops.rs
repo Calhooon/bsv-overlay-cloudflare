@@ -137,6 +137,10 @@ pub fn engine_walk_over_counter(limb: overlay_engine::engine::WalkLimb) -> &'sta
         }
         overlay_engine::engine::DoorLimb::Memory => COUNTER_SUBMIT_ENGINE_WALK_OVER_MEMORY,
         overlay_engine::engine::DoorLimb::Proof => COUNTER_SUBMIT_ENGINE_WALK_OVER_PROOF,
+        // `DoorLimb` is non-exhaustive: a limb this Worker does not know is still a walk that could not run,
+        // counted with the walks the door's budget stopped (never dropped from the count, never a memory or proof row
+        // it is not).
+        _ => COUNTER_SUBMIT_ENGINE_WALK_OVER_BUDGET,
     }
 }
 
@@ -220,6 +224,9 @@ pub fn script_walk_over_counter(limb: overlay_engine::engine::DoorLimb) -> &'sta
         }
         overlay_engine::engine::DoorLimb::Memory => COUNTER_SUBMIT_SCRIPT_WALK_OVER_MEMORY,
         overlay_engine::engine::DoorLimb::Proof => COUNTER_SUBMIT_SCRIPT_WALK_OVER_PROOF,
+        // `DoorLimb` is non-exhaustive: a limb this Worker does not know is still the door's own bound, counted
+        // with the walks past the door's budget.
+        _ => COUNTER_SUBMIT_SCRIPT_WALK_OVER_BUDGET,
     }
 }
 /// Non-MINED `/arc-ingest` status callbacks (X-FullStatusUpdates bodies with

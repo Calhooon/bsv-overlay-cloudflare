@@ -579,6 +579,10 @@ impl MutationReport {
 /// refusal: the WORK the interpreter will do, and the MEMORY the door will
 /// hold beside the caller's body. Each is estimated from the bytes before it
 /// is spent.
+/// NON-EXHAUSTIVE: a later release may add a limb's field, so outside this
+/// crate a budget is never a struct literal (nor `..DoorBudget::DEFAULT`): it
+/// is [`DoorBudget::DEFAULT`] and the `with_*` setters, one per field.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DoorBudget {
     /// The interpreter's stack memory limit: bounds every element, and is the
@@ -714,6 +718,46 @@ impl DoorBudget {
         max_proof_nodes: crate::beef_limits::LINK_ANCESTRY_PROOF_NODES_MAX,
     };
 
+    /// This budget with the interpreter's element limit
+    /// ([`DoorBudget::memory_limit`]) set to `memory_limit`.
+    #[must_use]
+    pub const fn with_memory_limit(mut self, memory_limit: usize) -> Self {
+        self.memory_limit = memory_limit;
+        self
+    }
+
+    /// This budget with the work limb ([`DoorBudget::max_work_bytes`]) set
+    /// to `max_work_bytes`.
+    #[must_use]
+    pub const fn with_max_work_bytes(mut self, max_work_bytes: u64) -> Self {
+        self.max_work_bytes = max_work_bytes;
+        self
+    }
+
+    /// This budget with the signature floor
+    /// ([`DoorBudget::sig_check_floor`]) set to `sig_check_floor`.
+    #[must_use]
+    pub const fn with_sig_check_floor(mut self, sig_check_floor: u64) -> Self {
+        self.sig_check_floor = sig_check_floor;
+        self
+    }
+
+    /// This budget with the memory limb ([`DoorBudget::max_memory_bytes`])
+    /// set to `max_memory_bytes`.
+    #[must_use]
+    pub const fn with_max_memory_bytes(mut self, max_memory_bytes: u64) -> Self {
+        self.max_memory_bytes = max_memory_bytes;
+        self
+    }
+
+    /// This budget with the proof limb ([`DoorBudget::max_proof_nodes`]) set
+    /// to `max_proof_nodes`.
+    #[must_use]
+    pub const fn with_max_proof_nodes(mut self, max_proof_nodes: u64) -> Self {
+        self.max_proof_nodes = max_proof_nodes;
+        self
+    }
+
     /// The proof limb over `body` ([`crate::stream_sizing::proof_limb`] at
     /// [`DoorBudget::max_proof_nodes`]): the frame's count, or the stop.
     pub fn proof_limb(
@@ -732,6 +776,10 @@ impl DoorBudget {
 }
 
 /// Which limb of the [`DoorBudget`] a walk went past.
+/// NON-EXHAUSTIVE: a later release may add a limb, so a `match` outside this
+/// crate carries a wildcard arm. A limb a caller does not know is still "the
+/// door's own bound": the network judges, never a refusal and never a pass.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DoorLimb {
     /// The static work estimate, or the interpreter's own memory limit
@@ -766,6 +814,11 @@ type Validated = (
 /// Which limb of the [`DoorBudget`] a submit's own walk went past (bsv-low
 /// #592): the [`DoorLimb`] of the door's error, with the interpreter's own
 /// memory limit told apart from the static work estimate.
+/// NON-EXHAUSTIVE: a later release may add a limb, so a `match` outside this
+/// crate carries a wildcard arm. A limb a caller does not know is still "the
+/// walk could not run": never an admission, and its name is
+/// [`WalkLimb::as_str`].
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalkLimb {
     /// The static work estimate.

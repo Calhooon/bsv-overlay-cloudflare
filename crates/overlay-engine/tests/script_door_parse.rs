@@ -371,10 +371,7 @@ fn e585f2_m1_the_scripts_charge_is_above_the_measured_heap() {
         let mut worst = (0.0f64, "");
         for (name, lock, unlock) in &shapes {
             let (body, subject) = on_a_proven_source(lock, unlock);
-            let lifted = DoorBudget {
-                max_memory_bytes: u64::MAX,
-                ..DoorBudget::DEFAULT
-            };
+            let lifted = DoorBudget::DEFAULT.with_max_memory_bytes(u64::MAX);
             let (free, peak) = walked(&body, &subject, lifted).await;
             let script = (lock.len() + unlock.len()) as f64;
             if peak as f64 / script > worst.0 {
@@ -389,10 +386,7 @@ fn e585f2_m1_the_scripts_charge_is_above_the_measured_heap() {
                     Err(e) => format!("{e}").chars().take(100).collect(),
                 }
             );
-            let at_its_peak = DoorBudget {
-                max_memory_bytes: peak as u64,
-                ..DoorBudget::DEFAULT
-            };
+            let at_its_peak = DoorBudget::DEFAULT.with_max_memory_bytes(peak as u64);
             let (bounded, _) = walked(&body, &subject, at_its_peak).await;
             assert!(
                 matches!(
