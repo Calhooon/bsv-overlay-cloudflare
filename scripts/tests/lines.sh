@@ -268,6 +268,8 @@ run beta-born --base origin/main --head cut
 [ "$code" -eq 0 ] || fail "the cut's pull request (beta's tip with main merged in) was refused: $(cat "$last")"
 grep -q "beta-born: the cut: $(short cut) is origin/beta $(short beta)'s history with 1 merge(s) of main into it" "$last" \
     || fail "the cut is not said: $(cat "$last")"
+grep -q "beta-born: the cut's merge $(short cut) .* writes, beyond a clean re-merge of its parents: Cargo.toml (read it: git show --remerge-diff $(short cut))" "$last" \
+    || fail "the honest cut's resolution in Cargo.toml is not printed: $(cat "$last")"
 #    the same cut branch with one commit born on it: refused, by name
 git checkout -q -b cut-extra cut
 echo born-on-the-cut > src/cut.rs; commit "born on the cut branch"
@@ -311,6 +313,91 @@ git push -q -f origin after:main
 carried beta
 [ "$code" -eq 1 ] || fail "main-in-beta is green though main holds a commit born after the cut (exit $code): $(cat "$last")"
 grep -q "main-in-beta: REFUSED $(short after) born on main after the cut" "$last" || fail "the commit born after the cut is not named: $(cat "$last")"
+
+# 10. what a cut's merge may write, where the branch is cut from, and how the cut lands (the cold review's
+#     fold): a fresh repository and remote; beta two commits past main's pick and a version commit
+git init -q --bare "$scratch/cutx.git"
+git init -q -b main "$scratch/cutx"
+cd "$scratch/cutx"
+git config user.email t@example.invalid; git config user.name t
+git remote add origin "$scratch/cutx.git"
+mkdir -p src
+printf '[workspace.package]\nversion = "0.1.0"\n' > Cargo.toml
+printf 'one\n' > src/lib.rs
+commit base; git push -q origin main
+git checkout -q -b beta main
+echo feat > src/feat.rs; commit "feat: one"; g1="$(git rev-parse HEAD)"
+git push -q origin beta
+git checkout -q main; git cherry-pick -x "$g1" >/dev/null; git push -q origin main
+git checkout -q beta
+echo feat2 > src/feat2.rs; commit "feat: two"
+sed -i.bak 's/0\.1\.0/0.2.0/' Cargo.toml; rm -f ./*.bak; commit "0.2.0"
+git push -q origin beta
+#     the honest cut: passes, and says its merge wrote nothing beyond a clean re-merge
+git checkout -q -b cutx beta; git merge -q --no-edit main >/dev/null
+run beta-born --base origin/main --head cutx
+[ "$code" -eq 0 ] || fail "cutx: the honest cut was refused: $(cat "$last")"
+grep -q "beta-born: the cut's merge $(short cutx) .* writes, beyond a clean re-merge of its parents: nothing" "$last" \
+    || fail "cutx: the clean merge is not said to write nothing: $(cat "$last")"
+#     a merge whose resolution creates a file neither parent has, and appends a line: refused by the file's name
+git checkout -q -b cut-evil beta; git merge -q --no-commit main >/dev/null 2>&1 || true
+echo backdoor > src/backdoor.rs; echo EVIL >> src/feat.rs; git add -A; git commit -q --no-edit
+run beta-born --base origin/main --head cut-evil
+[ "$code" -eq 1 ] || fail "cutx: a merge that creates a file passed (exit $code): $(cat "$last")"
+grep -q "beta-born: REFUSED $(short cut-evil) .*: its resolution creates src/backdoor.rs, which neither parent has" "$last" \
+    || fail "cutx: the created file is not named: $(cat "$last")"
+#     a merge that only appends a line to a file a parent has: printed, passed (a reviewer's)
+git checkout -q -b cut-append beta; git merge -q --no-commit main >/dev/null 2>&1 || true
+echo EVIL >> src/feat.rs; git add -A; git commit -q --no-edit
+run beta-born --base origin/main --head cut-append
+[ "$code" -eq 0 ] || fail "cutx: a merge that appends a line was refused: $(cat "$last")"
+grep -q "writes, beyond a clean re-merge of its parents: src/feat.rs (read it: git show --remerge-diff $(short cut-append))" "$last" \
+    || fail "cutx: the appended line's file is not printed: $(cat "$last")"
+#     a git without `git show --remerge-diff` cannot read the merges: exit 2, never a pass
+mkdir -p "$scratch/oldgit"; realgit="$(command -v git)"
+printf '#!/bin/sh\nif [ "$1" = version ]; then echo "git version 2.30.0"; exit 0; fi\nexec "%s" "$@"\n' "$realgit" > "$scratch/oldgit/git"
+chmod +x "$scratch/oldgit/git"
+PATH="$scratch/oldgit:$PATH" run beta-born --base origin/main --head cutx
+[ "$code" -eq 2 ] || fail "cutx: a git too old for --remerge-diff answered $code, not 2: $(cat "$last")"
+#     a cut branch cut from an OLD commit of beta: refused, naming the commit and beta's tip
+git checkout -q -b cut-old beta~1; git merge -q --no-edit main >/dev/null
+run beta-born --base origin/main --head cut-old
+[ "$code" -eq 1 ] || fail "cutx: a cut from an old beta commit passed (exit $code): $(cat "$last")"
+grep -q "beta-born: REFUSED: the cut branch was cut from $(short beta~1) feat: two, a commit of beta that is not its tip $(short beta) 0.2.0" "$last" \
+    || fail "cutx: the old commit and beta's tip are not named: $(cat "$last")"
+#     the cut branch REBASED onto main (the "Update branch" button's rebase): the merges are gone and beta's
+#     version commit arrives with a new sha: refused as a copy of beta's own version commit
+git checkout -q -b cut-rebased cutx; git rebase -q origin/main >/dev/null 2>&1
+[ -z "$(git rev-list --merges origin/main..cut-rebased)" ] || fail "cutx: the fixture's rebase kept a merge"
+run beta-born --base origin/main --head cut-rebased
+[ "$code" -eq 1 ] || fail "cutx: a rebased cut branch passed (exit $code): $(cat "$last")"
+grep -q "beta-born: REFUSED $(short cut-rebased) 0.2.0" "$last" && grep -q "copies of beta's own version commits" "$last" \
+    || fail "cutx: the rebased version commit is not named: $(cat "$last")"
+#     cut-landed, after the merge: green on the merge commit; red, named, on a squash and on a rebase
+before="$(git rev-parse origin/main)"
+git checkout -q main; git merge -q --no-ff --no-edit -m "the cut" cutx; git push -q origin main
+run cut-landed --cut cutx
+[ "$code" -eq 0 ] || fail "cutx: cut-landed is red on the cut's merge commit: $(cat "$last")"
+grep -q "cut-landed: main's tip $(short main) is a merge commit: first parent $(short "$before"), second the cut branch $(short cutx) cut from beta $(short beta)" "$last" \
+    || fail "cutx: cut-landed does not say the merge: $(cat "$last")"
+git checkout -q -b squashed "$before"; git merge -q --squash cutx >/dev/null; git commit -qm "the cut (squashed)"
+git push -q -f origin squashed:main
+run cut-landed --cut cutx
+[ "$code" -eq 1 ] || fail "cutx: cut-landed is green on a squash (exit $code): $(cat "$last")"
+grep -q "cut-landed: REFUSED $(short squashed) the cut (squashed): main's tip has 1 parent(s), not a merge commit: the cut was SQUASHED" "$last" \
+    || fail "cutx: the squash is not named: $(cat "$last")"
+git push -q -f origin cut-rebased:main
+run cut-landed --cut cutx
+[ "$code" -eq 1 ] || fail "cutx: cut-landed is green on a rebase (exit $code): $(cat "$last")"
+grep -q "cut-landed: REFUSED $(short cut-rebased) 0.2.0: main's tip has 1 parent(s), not a merge commit: the cut was REBASED" "$last" \
+    || fail "cutx: the rebase is not named: $(cat "$last")"
+git checkout -q -b side "$before"; echo side > src/side.rs; commit "side"
+git checkout -q -b notcut "$before"; git merge -q --no-ff --no-edit -m "a merge that is not the cut" side
+git push -q -f origin notcut:main
+run cut-landed
+[ "$code" -eq 1 ] || fail "cutx: cut-landed is green on a merge that is not the cut (exit $code): $(cat "$last")"
+grep -q "cut-landed: REFUSED $(short notcut) a merge that is not the cut: main's tip is a merge whose second parent $(short side) side is not a cut branch" "$last" \
+    || fail "cutx: the merge that is not the cut is not named: $(cat "$last")"
 cd "$scratch/repo"
 
 # 8. a check that cannot run is never a pass: a remote that does not answer
@@ -318,4 +405,4 @@ git remote set-url origin "$scratch/gone.git"
 born fix-1
 [ "$code" -eq 2 ] || fail "beta-born with an unreachable remote answered $code, not 2: $(cat "$last")"
 
-echo "lines-test: PASS (no beta branch passes with the one line; a commit born on main refused by sha; a hand-resolved cherry-pick -x of a beta commit passes, a same-patch pick passes; a line naming a commit beta lacks, or no commit, refused; a release commit passes and is said, one that moves a dependency refused; the cut's own pull request passes, a merge commit refused; the marker read at the base: unborn passes, born with no branch fails, unreadable is exit 2; a borrowed line over other paths, a quoted line, an empty commit under a line and a beta link of other paths refused; a whitespace-only variant refused, the verbatim pick passes; main-in-beta green by main's own line, red on a fix beta lacks, green once carried by -x or by patch, red on an empty commit that only names it; a line naming a commit both lines hold refused by both checks; a release that repoints an internal dependency's path refused; a full life: the cut's pull request (beta's tip with main merged in) passes, one with a commit born on it or a merge of a third branch refused, a merge of main on a branch cut from main refused, main takes it by one merge commit and holds every beta sha and the prerelease tag, main-in-beta green after it and after a second cut, judged from the last cut, a pick made after the cut green on both checks, a commit born on main after the cut refused by both; an unreachable remote is exit 2)"
+echo "lines-test: PASS (no beta branch passes with the one line; a commit born on main refused by sha; a hand-resolved cherry-pick -x of a beta commit passes, a same-patch pick passes; a line naming a commit beta lacks, or no commit, refused; a release commit passes and is said, one that moves a dependency refused; the cut's own pull request passes, a merge commit refused; the marker read at the base: unborn passes, born with no branch fails, unreadable is exit 2; a borrowed line over other paths, a quoted line, an empty commit under a line and a beta link of other paths refused; a whitespace-only variant refused, the verbatim pick passes; main-in-beta green by main's own line, red on a fix beta lacks, green once carried by -x or by patch, red on an empty commit that only names it; a line naming a commit both lines hold refused by both checks; a release that repoints an internal dependency's path refused; a full life: the cut's pull request (beta's tip with main merged in) passes, one with a commit born on it or a merge of a third branch refused, a merge of main on a branch cut from main refused, main takes it by one merge commit and holds every beta sha and the prerelease tag, main-in-beta green after it and after a second cut, judged from the last cut, a pick made after the cut green on both checks, a commit born on main after the cut refused by both; a cut's merge printed by what it writes beyond a clean re-merge, one that creates a file refused, a git without --remerge-diff exit 2, a cut from an old beta commit refused, a rebased cut branch refused, cut-landed green on the merge commit and red on a squash, on a rebase and on a merge that is not the cut; an unreachable remote is exit 2)"
