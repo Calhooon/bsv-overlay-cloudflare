@@ -132,8 +132,14 @@ impl ChainTracker for BrokenTracker {
 
 /// A chain tracker that knows exactly one (height, root): the fabricated
 /// single-transaction block of a fixture's funding tx.
+///
+/// Its tip is 100 blocks above the proof (LOCK-0814): the funding is the
+/// block's only leaf, at offset 0, a coinbase's place, and since bsv-rs 0.8.14
+/// (GHSA-grrj-gwrr-v7r3) `Transaction::verify` refuses an offset-0 proof under
+/// 100 blocks deep. It was `HEIGHT + 10`; the engine's own walk reads no
+/// depth, so only the two tests that call bsv-rs's `verify` moved.
 fn tracker_knowing(funding_txid: &str) -> Box<dyn ChainTracker> {
-    let mut tracker = MockChainTracker::new(HEIGHT + 10);
+    let mut tracker = MockChainTracker::new(HEIGHT + 100);
     tracker.add_root(HEIGHT, funding_txid.to_string());
     Box::new(tracker)
 }
