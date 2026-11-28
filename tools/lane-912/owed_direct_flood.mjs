@@ -136,12 +136,14 @@ try {
     const ackedBefore = await counter('owed_events_direct_acked_total')
     // (2) the flood: four hook bodies at once, eight identities each
     const t0 = Date.now()
+    // CI-315B: each body read ONCE, at once (Miniflare's fetch wrapper leaves undici's own Response unreachable, and its
+    // GC finalizer cancels the shared body stream: a body read after a later await can read "Body has already been read")
     const answers = await Promise.all([0, 1, 2, 3].map(k => mf.dispatchFetch('http://app/internal/hop-changed', {
       method: 'POST', headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' },
       body: JSON.stringify({ identities: seats.slice(8 * k, 8 * k + 8).map(s => s.identity) }),
-    })))
+    }).then(r => r.text().then(text => ({ status: r.status, text }), e => ({ status: r.status, text: `<<body unreadable: ${e.message}>>` })))))
     const answeredMs = Date.now() - t0
-    for (const a of answers) assert.equal(a.status, 200, `${tag}: the hook answered: ${await a.text()}`)
+    answers.forEach((a, k) => assert.equal(a.status, 200, `${tag}: hook body ${k} answered ${a.status}: ${a.text.slice(0, 600)}`))
     // (3) each actor's first visibility
     const seen = new Map()
     await poll(`${tag}: the 32 actors' first visibility`, async () => {
