@@ -202,10 +202,7 @@ fn small_bodies() -> Bodies {
 }
 
 fn small_budget() -> DoorBudget {
-    DoorBudget {
-        max_proof_nodes: SMALL_LIMB,
-        ..DoorBudget::DEFAULT
-    }
+    DoorBudget::DEFAULT.with_max_proof_nodes(SMALL_LIMB)
 }
 
 /// A frame one node past the DEFAULT, built by hand (nothing parsed or
@@ -538,10 +535,7 @@ fn ib_c_the_script_door_stops_one_past_the_limb() {
     }
     block_on(engine.verify_scripts_only(&bodies.at.0, &bodies.at.1.id()))
         .expect("at the limb the door walks");
-    let both = DoorBudget {
-        max_memory_bytes: 1024,
-        ..small_budget()
-    };
+    let both = small_budget().with_max_memory_bytes(1024);
     match block_on(engine.verify_scripts_only_under(&bodies.past.0, &bodies.past.1.id(), both)) {
         Err(EngineError::ScriptWalkOverBudget { limb, .. }) => assert_eq!(limb, DoorLimb::Memory),
         other => panic!("{other:?}"),
@@ -598,10 +592,7 @@ fn ib_d_the_anchor_holds_a_root_past_the_limb() {
             Err(GASPError::AnchorWalkHeld(why)) => assert!(why.contains("over_proof"), "{why}"),
             other => panic!("held at the root BEEF: {other:?}"),
         }
-        let gasp = held(DoorBudget {
-            max_proof_nodes: 2 * SMALL_LIMB,
-            ..DoorBudget::DEFAULT
-        });
+        let gasp = held(DoorBudget::DEFAULT.with_max_proof_nodes(2 * SMALL_LIMB));
         gasp.append_to_graph(&node(&root_tx), None).await.unwrap();
         gasp.validate_graph_anchor(&format!("{}.0", root_tx.id()))
             .await
@@ -619,20 +610,14 @@ fn ib_d_the_anchor_holds_a_root_past_the_limb() {
 fn ib_e_the_limb_is_configuration() {
     let _g = one_at_a_time();
     let bodies = small_bodies();
-    let roomy = engine_under(DoorBudget {
-        max_proof_nodes: SMALL_LIMB + 1,
-        ..DoorBudget::DEFAULT
-    });
+    let roomy = engine_under(DoorBudget::DEFAULT.with_max_proof_nodes(SMALL_LIMB + 1));
     for (door, r) in block_on(every_submit(&roomy, &bodies.past.0)) {
         r.unwrap_or_else(|e| panic!("{door}: the roomier limb admits it: {e}"));
     }
     assert_eq!(roomy.walk_budget().max_proof_nodes, SMALL_LIMB + 1);
     // And the DEFAULT width: lifted, a frame one past the default is read
     // (its parse refuses it, a hand-built BUMP; never the proof limb).
-    let lifted = engine_under(DoorBudget {
-        max_proof_nodes: u64::MAX,
-        ..DoorBudget::DEFAULT
-    });
+    let lifted = engine_under(DoorBudget::DEFAULT.with_max_proof_nodes(u64::MAX));
     let body = one_past_the_default_frame(None);
     if let Err(e) = block_on(lifted.submit(&tagged(&body), SubmitMode::HistoricalTxNoSpv)) {
         assert!(!over_proof(&e), "lifted, the limb does not stop it: {e}");
@@ -1195,10 +1180,7 @@ fn ibf2_l4_the_finalize_without_the_anchor_reads_the_configured_limb() {
     block_on(async {
         let store = MemoryStorage::new();
         let manager = AdmitZero;
-        let raised = DoorBudget {
-            max_proof_nodes: 2 * LINK_ANCESTRY_PROOF_NODES_MAX,
-            ..DoorBudget::DEFAULT
-        };
+        let raised = DoorBudget::DEFAULT.with_max_proof_nodes(2 * LINK_ANCESTRY_PROOF_NODES_MAX);
         let root_tx = prove_wide(coin(31), LINK_ANCESTRY_PROOF_NODES_MAX + 2);
         assert!(nodes_of(&root_tx) > LINK_ANCESTRY_PROOF_NODES_MAX);
         assert!(nodes_of(&root_tx) <= raised.max_proof_nodes);

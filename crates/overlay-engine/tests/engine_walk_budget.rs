@@ -396,10 +396,7 @@ fn e592_c_a_clean_false_and_a_structural_fault_are_unchanged() {
 fn e592_the_budget_is_configured_on_the_engine() {
     one_at_a_time(async {
         assert_eq!(engine().walk_budget(), DoorBudget::DEFAULT);
-        let tight = DoorBudget {
-            max_memory_bytes: 1024,
-            ..DoorBudget::DEFAULT
-        };
+        let tight = DoorBudget::DEFAULT.with_max_memory_bytes(1024);
         let built = EngineBuilder::new(Box::new(MemoryStorage::new()))
             .with_topic(TOPIC, Box::new(AdmitOutputZero))
             .with_walk_budget(tight)
@@ -1169,10 +1166,7 @@ fn e592_q8_7_the_doors_walk_runs_under_the_engines_budget() {
 
         // A tighter engine: the door's walk and the submit's walk answer the
         // same "over budget".
-        let tight = DoorBudget {
-            max_work_bytes: DoorBudget::DEFAULT.max_work_bytes / 2,
-            ..DoorBudget::DEFAULT
-        };
+        let tight = DoorBudget::DEFAULT.with_max_work_bytes(DoorBudget::DEFAULT.max_work_bytes / 2);
         let engine = EngineBuilder::new(Box::new(MemoryStorage::new()))
             .with_topic(TOPIC, Box::new(AdmitOutputZero))
             .with_walk_budget(tight)
