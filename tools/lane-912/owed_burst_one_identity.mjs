@@ -92,12 +92,14 @@ try {
     const seq = seq0 + i
     wrote.set(seq, at)
     const ev = { v: 1, seq, source: 'hop', sourceKey: `${g.txid}:${template.hopVout}`, facts: { marks: 1, row: null }, atMs: at }
-    return mf.dispatchFetch('http://app/internal/owed-direct', {
+    // CI-315B: the body read ONCE, at once (see owed_direct_flood.mjs: Miniflare's fetch wrapper and undici's GC finalizer)
+    const r = await mf.dispatchFetch('http://app/internal/owed-direct', {
       method: 'POST', headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' },
       body: JSON.stringify({ events: [JSON.stringify(ev)] }),
     })
+    return r.text().then(text => ({ status: r.status, text }), e => ({ status: r.status, text: `<<body unreadable: ${e.message}>>` }))
   }))
-  for (const a of answers) assert.equal(a.status, 202, `the hand-off answered: ${await a.text()}`)
+  answers.forEach((a, i) => assert.equal(a.status, 202, `hand-off ${i} answered ${a.status}: ${a.text.slice(0, 600)}`))
   // (3) every event recorded applied by the actor, each within 1 s of its write
   const applied = await poll('the 64 events applied', async () => {
     const rows = (await (await actor.fetch('http://owed-actor/pin/applied?kind=hop')).json()).rows.filter(r => wrote.has(Number(r.seq)))
