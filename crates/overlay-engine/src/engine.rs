@@ -891,7 +891,17 @@ impl WalkLimb {
     /// alone): no block makes them pass, so a client must not retry them.
     #[must_use]
     pub fn same_bytes_will_fail(self) -> bool {
-        matches!(self, WalkLimb::OverProof)
+        // Exhaustive on purpose (no wildcard arm): a limb added to this enum
+        // must say here whether the same bytes can ever pass, or the crate
+        // does not compile.
+        match self {
+            WalkLimb::OverProof => true,
+            WalkLimb::OverWork
+            | WalkLimb::OverMemory
+            | WalkLimb::InterpreterMemory
+            | WalkLimb::CoinEra
+            | WalkLimb::OverLink => false,
+        }
     }
 }
 

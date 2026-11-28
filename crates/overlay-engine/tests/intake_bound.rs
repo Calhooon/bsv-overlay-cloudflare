@@ -431,13 +431,8 @@ fn ib_a_the_stop_holds_nothing() {
     // One merkle path's bytes: the same count.
     let p = prove_wide(coin(3), SMALL_LIMB);
     let bytes = p.merkle_path.as_ref().unwrap().to_binary();
-    assert_eq!(
-        path_proof_limb(&bytes, SMALL_LIMB),
-        Ok(bsv_overlay_engine::stream_sizing::ProofFrame {
-            nodes: SMALL_LIMB,
-            read: true
-        })
-    );
+    let frame = path_proof_limb(&bytes, SMALL_LIMB).unwrap();
+    assert_eq!((frame.nodes, frame.read), (SMALL_LIMB, true));
     assert!(path_proof_limb(&bytes, SMALL_LIMB - 1).is_err());
 }
 
