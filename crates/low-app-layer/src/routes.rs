@@ -8699,6 +8699,68 @@ mod e606_tests {
         }
     }
 
+    /// LOCK-0814: a courier's TSC proof whose `index` lies one past the width of the tree its `nodes` span does
+    /// not read: `courier_tsc_bump` refuses it before any path is built, so no BUMP reaches the proof's check, the
+    /// mined claim stays a hint and the leg counts `tx_any_courier_proof_fault_total` (the courier's proof fault).
+    /// The check is a stand-in that would accept any BUMP, so a path handed on is a confirmation: RED with the
+    /// converter's guard removed.
+    #[test]
+    fn lock0814_a_courier_proof_index_outside_its_tree_is_a_proof_fault() {
+        let (txid, raw) = competitor();
+        let sibling = tx(0x44);
+        // One node: a tree of 2 leaves, offsets 0 and 1. 1 reads; 2 is one past its width.
+        for (index, reads) in [(1u64, true), (2u64, false)] {
+            let proof = serde_json::json!({"index":index,"txOrId":txid,"nodes":[sibling]})
+                .to_string()
+                .into_bytes();
+            assert_eq!(
+                crate::txany::courier_tsc_bump(&proof, 970733).is_some(),
+                reads,
+                "index {index} of a one-node proof"
+            );
+            let get = |url: String| {
+                let response = if url.contains("/tx/hash/") {
+                    (200, mined_body(&txid))
+                } else if url.ends_with("/proof/tsc") {
+                    (200, proof.clone())
+                } else if url.ends_with("/hex") {
+                    (200, hex::encode(&raw).into_bytes())
+                } else {
+                    (404, vec![])
+                };
+                std::future::ready(Some(response))
+            };
+            let checked = std::cell::Cell::new(0);
+            let _ = crate::courier::take_pending_if_due(0.0);
+            let (obs, absence, _) = run(tx_any_presence_leg_via(
+                &txid,
+                1234,
+                false,
+                None,
+                get,
+                |_, _| {
+                    checked.set(checked.get() + 1);
+                    std::future::ready(true)
+                },
+            ));
+            let a = decide_tx_any(None, None, Some(&obs), absence);
+            let faults: u64 = crate::courier::take_pending_if_due(0.0)
+                .into_iter()
+                .filter(|(name, _)| name == "tx_any_courier_proof_fault_total")
+                .map(|(_, n)| n)
+                .sum();
+            if reads {
+                assert_eq!((checked.get(), a.confirmed, faults), (1, Some(true), 0));
+            } else {
+                assert_eq!(
+                    (checked.get(), a.confirmed, faults),
+                    (0, None, 1),
+                    "an index outside its tree is no BUMP and the courier's proof fault"
+                );
+            }
+        }
+    }
+
     /// WoC's `/tx/hash` body for a MEMPOOL transaction, the keys as probed live 2026-10-12 (no `confirmations`).
     fn mempool_body(txid: &str) -> Vec<u8> {
         serde_json::json!({"hash": txid, "locktime": 0, "size": 85, "txid": txid, "version": 1,

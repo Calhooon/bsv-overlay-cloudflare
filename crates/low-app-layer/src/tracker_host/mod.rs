@@ -317,6 +317,12 @@ pub fn tsc_proof(txid: &str, height: u32, body: &[u8]) -> Result<Proof, String> 
     if nodes.is_empty() || nodes.len() > 64 {
         return Err("TSC path depth".into());
     }
+    // LOCK-0814: an index outside the tree the nodes span is no proof of this
+    // txid (bsv-rs 0.8.14's BUMP reader refuses the path it builds): refused
+    // before a path is built, on either bsv-rs.
+    if crate::txany::tsc_index_outside_tree(offset, nodes.len()) {
+        return Err("TSC index outside its tree".into());
+    }
     let mut path = Vec::new();
     for (level, node) in nodes.iter().enumerate() {
         let mut leaves = Vec::new();

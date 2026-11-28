@@ -176,6 +176,17 @@ pub fn mined_proof_matches(txid: &str, bump_hex: &str, height: u64, canonical: &
     .is_some_and(|root| root.eq_ignore_ascii_case(canonical))
 }
 
+/// LOCK-0814: a TSC proof's `index` lies outside the tree its `levels` nodes
+/// span (`index >> levels != 0`; a shift of 64 or more leaves every `u64`
+/// inside). The overlay's `proof_fetcher::tsc_index_outside_tree` and
+/// `tracker_host::tsc_proof` read the same rule.
+pub fn tsc_index_outside_tree(index: u64, levels: usize) -> bool {
+    u32::try_from(levels)
+        .ok()
+        .and_then(|levels| index.checked_shr(levels))
+        .is_some_and(|rest| rest != 0)
+}
+
 /// WoC's documented TSC courier shape, converted to a BUMP before binding.
 pub fn courier_tsc_bump(body: &[u8], height: u64) -> Option<String> {
     use bsv_rs::transaction::{MerklePath, MerklePathLeaf};
@@ -189,8 +200,15 @@ pub fn courier_tsc_bump(body: &[u8], height: u64) -> Option<String> {
         return None;
     }
     let mut offset = v.get("index")?.as_u64()?;
+    let nodes = v.get("nodes")?.as_array()?;
+    // LOCK-0814: an index outside the tree the nodes span is no proof of this
+    // txid (bsv-rs 0.8.14's BUMP reader refuses the path it builds): refused
+    // before a path is built, on either bsv-rs.
+    if tsc_index_outside_tree(offset, nodes.len()) {
+        return None;
+    }
     let mut path = Vec::new();
-    for (level, node) in v.get("nodes")?.as_array()?.iter().enumerate() {
+    for (level, node) in nodes.iter().enumerate() {
         let mut leaves = Vec::new();
         if level == 0 {
             leaves.push(MerklePathLeaf::new_txid(offset, txid.to_string()));
@@ -1087,6 +1105,20 @@ pub fn spent_any_body_sourced(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    /// LOCK-0814: the rule the three TSC converters read, at its edges: a tree of n levels spans 2^n leaves, so
+    /// 2^n - 1 is inside and 2^n is not; 64 levels or more leave every u64 inside (no shift overflow).
+    #[test]
+    fn lock0814_a_tsc_index_outside_tree_at_its_edges() {
+        for n in 1..64usize {
+            assert!(!tsc_index_outside_tree((1u64 << n) - 1, n), "{n} levels");
+            assert!(tsc_index_outside_tree(1u64 << n, n), "{n} levels");
+        }
+        assert!(tsc_index_outside_tree(1, 0));
+        assert!(!tsc_index_outside_tree(0, 0));
+        assert!(!tsc_index_outside_tree(u64::MAX, 64));
+        assert!(!tsc_index_outside_tree(u64::MAX, 200));
+    }
+
     use super::*;
 
     /// bsv-low #451 slice C (iii): a verdict memo answers for its own txid inside the hour, never older, never
