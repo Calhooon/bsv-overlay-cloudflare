@@ -1547,6 +1547,17 @@ pub fn tsc_json_to_bump_hex(json_str: &str, block_height: u32) -> Option<String>
     Some(mp.to_hex())
 }
 
+/// LOCK-0814: a TSC proof's `index` lies outside the tree its `levels` nodes
+/// span (`index >> levels != 0`; a shift of 64 or more leaves every `u64`
+/// inside). The one rule the three TSC converters read (`txany::courier_tsc_bump`
+/// and `tracker_host::tsc_proof` in the app layer spell the same test).
+pub(crate) fn tsc_index_outside_tree(index: u64, levels: usize) -> bool {
+    u32::try_from(levels)
+        .ok()
+        .and_then(|levels| index.checked_shr(levels))
+        .is_some_and(|rest| rest != 0)
+}
+
 /// Build a `MerklePath` from TSC components (same algorithm as the JS reference
 /// `convertProofToMerklePath()`).
 fn tsc_proof_to_merkle_path(
@@ -1560,6 +1571,18 @@ fn tsc_proof_to_merkle_path(
     }
     if txid.len() != 64 || hex::decode(txid).is_err() {
         return Err("invalid txid".to_string());
+    }
+    // LOCK-0814: a TSC proof's `index` is the txid's place among the leaves
+    // of a tree as tall as its `nodes`; one past that tree's width is no
+    // proof of this txid. bsv-rs 0.8.14's BUMP reader refuses the path such
+    // an index builds ("a leaf outside its level"), where 0.8.13 read it and
+    // computed a meaningless root: refused here, before any path is built,
+    // on either bsv-rs.
+    if tsc_index_outside_tree(index, nodes.len()) {
+        return Err(format!(
+            "index {index} lies outside the tree its {} nodes span",
+            nodes.len()
+        ));
     }
 
     let mut path: Vec<Vec<MerklePathLeaf>> = Vec::new();
@@ -7706,6 +7729,47 @@ pub(crate) mod tests {
         // A bad-length node hash is rejected.
         let bad = r#"{"index":0,"txOrId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","nodes":["zz"]}"#;
         assert!(tsc_json_to_bump_hex(bad, HEIGHT).is_none());
+    }
+
+    /// LOCK-0814: a TSC proof whose `index` lies one past the width of the tree its `nodes` span does not read:
+    /// the converter refuses it before any path is built (the admin probe then answers `invalid-tsc`, its shape
+    /// fault). The last index inside still converts and parses back. The path the unguarded converter built for
+    /// that index is refused by bsv-rs 0.8.14's BUMP reader (it read on 0.8.13): the converter no longer hands it
+    /// on. RED with the guard removed (`tsc_json_to_bump_hex` answers `Some`).
+    #[test]
+    fn lock0814_a_tsc_index_outside_its_tree_does_not_read() {
+        let txid = "a".repeat(64);
+        let nodes = ["b".repeat(64), "c".repeat(64), "d".repeat(64)];
+        let json =
+            |index: u64| serde_json::json!({"index":index,"txOrId":txid,"nodes":nodes}).to_string();
+        let inside =
+            tsc_json_to_bump_hex(&json(7), HEIGHT).expect("the last index inside converts");
+        MerklePath::from_hex(&inside).expect("and parses back");
+        assert!(
+            tsc_json_to_bump_hex(&json(8), HEIGHT).is_none(),
+            "one past the width"
+        );
+        assert!(tsc_body_to_bump_hex(&format!("[{}]", json(8)), HEIGHT).is_none());
+        assert!(tsc_json_to_bump_hex(&json(u64::MAX), HEIGHT).is_none());
+        assert!(tsc_index_outside_tree(8, 3) && !tsc_index_outside_tree(7, 3));
+        // The path an unguarded converter builds for index 8: bsv-rs's constructor takes it, its reader does not.
+        let mut path = Vec::new();
+        let mut offset = 8u64;
+        for (level, node) in nodes.iter().enumerate() {
+            let mut leaves = Vec::new();
+            if level == 0 {
+                leaves.push(MerklePathLeaf::new_txid(offset, txid.clone()));
+            }
+            leaves.push(MerklePathLeaf::new(offset ^ 1, node.clone()));
+            leaves.sort_by_key(|l| l.offset);
+            path.push(leaves);
+            offset /= 2;
+        }
+        let built = MerklePath::new(HEIGHT, path).expect("the constructor checks no tree width");
+        assert!(
+            MerklePath::from_hex(&built.to_hex()).is_err(),
+            "bsv-rs 0.8.14's reader refuses a leaf outside its level"
+        );
     }
 
     // ── 3. verify_bump against chaintracks (rejects a forged root) ───────────

@@ -156,6 +156,25 @@ fn ns3_banana_captured_tsc_root_reduces_through_sdk() {
     );
 }
 
+/// LOCK-0814: the captured BananaBlocks TSC proof with its `index` moved one past the width of the tree its
+/// `nodes` span does not read: `tsc_proof` refuses it before any path is built, so the rung answers no proof
+/// and the ladder goes on to the next (on bsv-rs 0.8.14 the path it would build is refused by the BUMP reader).
+/// RED with the converter's guard removed.
+#[test]
+fn lock0814_b_tsc_proof_index_outside_its_tree_does_not_read() {
+    let txid = "91309122f5630052f7e57f7db843d26d32ae4426a9dd9b2fc2955f2fab8cf9a6";
+    let mut v: serde_json::Value =
+        serde_json::from_slice(include_bytes!("fixtures/ns3/banana-tsc.json")).unwrap();
+    let proof = if v.is_array() { &mut v[0] } else { &mut v };
+    let levels = proof["nodes"].as_array().unwrap().len();
+    proof["index"] = json!(1u64 << levels);
+    let body = serde_json::to_vec(&v).unwrap();
+    assert_eq!(
+        tsc_proof(txid, 956597, &body).err().as_deref(),
+        Some("TSC index outside its tree")
+    );
+}
+
 #[tokio::test]
 async fn ns3_m2_bracketed_snapshot_retries_once() {
     let calls = std::cell::Cell::new(0);
