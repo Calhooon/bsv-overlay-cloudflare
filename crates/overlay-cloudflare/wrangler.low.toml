@@ -262,9 +262,11 @@ ENVIRONMENT = "production"
 # The per-environment topic namespace. MUST match the client's
 # VITE_OVERLAY_TOPIC_SUFFIX (app/.env.beta) — a mismatch means every submit
 # and lookup is refused, which is the intended fail-closed behaviour.
-# Lowercase letters + a single leading underscore ONLY: the BRC-87 name
-# validator rejects digits, so `_beta2` would make our own SHIP ad
-# self-reject.
+# One leading underscore, then lowercase letters: the suffixed name must
+# pass the name rule (`tm_`/`ls_`, groups of lowercase letters and digits
+# joined by single underscores, 256 at most). The rule admits a digit, but
+# a host on a release before this rule refuses a name that holds one, so a
+# suffix such as `_beta2` would not be read there.
 TOPIC_SUFFIX = "_beta"
 CHAIN_TRACKER_URL = "https://__HOST_CHAINTRACKS__"
 # Its OWN hosting URL — also what scopes this deploy's advertisement set.

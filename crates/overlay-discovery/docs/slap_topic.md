@@ -49,7 +49,7 @@ If any step fails, the SLAP output is rejected.
    - If fewer or more than 5 fields are found, the SLAP manager will skip the output.
 2. **Valid `service`**:
    - Must begin with `ls_`.
-   - Only letters (lowercase) and underscores are allowed, per `isValidTopicOrServiceName` (BRC-87).
+   - After the prefix: groups of lowercase letters and digits joined by single underscores, 256 characters at most in all, per `isValidTopicOrServiceName`.
 3. **Advertised URI**:
    - Must not be `localhost`.
    - Must use a recognized scheme (`https://`, `wss://`, or specialized custom `https+bsvauth...` forms).
