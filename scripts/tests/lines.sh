@@ -218,9 +218,104 @@ carried beta
 grep -q "main-in-beta: REFUSED $(short main) born on main under a line" "$last" || fail "the landed commit is not named: $(cat "$last")"
 git checkout -q beta
 
+# 9. a full life on a fresh repository and remote: the birth; a clean pick and a hand-resolved pick to main; a
+#    release commit on main; a prerelease tag on beta; THE CUT (a branch cut from beta's tip with main merged
+#    into it, a conflict resolved there), taken by main as ONE merge commit; then life after the cut, a second
+#    cut, and a commit born on main after them
+git init -q --bare "$scratch/life.git"
+git init -q -b main "$scratch/life"
+cd "$scratch/life"
+git config user.email t@example.invalid; git config user.name t
+git remote add origin "$scratch/life.git"
+mkdir -p src
+printf '[workspace.package]\nversion = "0.1.0"\n' > Cargo.toml
+printf '# Changelog\n' > CHANGELOG.md
+printf 'one\ntwo\nthree\nfour\nfive\n' > src/lib.rs
+commit base; git push -q origin main
+git checkout -q -b beta main; git push -q origin beta                           # the birth
+printf 'one\nTWO\nthree\nfour\nfive\n' > src/lib.rs; commit "fix: two"; f1="$(git rev-parse HEAD)"
+echo three > src/three.rs; commit "fix: three"; f2="$(git rev-parse HEAD)"
+git push -q origin beta
+git checkout -q main; git cherry-pick -x "$f2" >/dev/null                         # a clean pick
+git cherry-pick -x "$f1" >/dev/null                                               # a pick resolved by hand
+echo "resolved by hand" >> src/lib.rs; git add -A; git commit -q --amend --no-edit
+run beta-born --base origin/main --head main
+[ "$code" -eq 0 ] || fail "life: the two picks were refused: $(cat "$last")"
+git push -q origin main
+sed -i.bak 's/0\.1\.0/0.1.1/' Cargo.toml; rm -f ./*.bak; printf '# Changelog\n\n## [0.1.1]\n' > CHANGELOG.md
+commit "0.1.1"; release="$(git rev-parse HEAD)"                                   # a release commit on main
+run beta-born --base origin/main --head main
+[ "$code" -eq 0 ] || fail "life: the release commit was refused: $(cat "$last")"
+git push -q origin main
+#    a branch cut from MAIN whose one commit merges main, its resolution carrying a file: not the cut, refused
+git checkout -q -b sneak main~1; git merge -q --no-ff --no-edit -m "merge main, with a file" main
+echo sneaked > src/sneak.rs; git add -A; git commit -q --amend --no-edit
+run beta-born --base origin/main --head sneak
+[ "$code" -eq 1 ] || fail "a merge of main on a branch cut from main passed as a cut (exit $code): $(cat "$last")"
+grep -q "beta-born: REFUSED $(short sneak) merge main, with a file" "$last" || fail "the merge on a main branch is not named: $(cat "$last")"
+git checkout -q beta
+printf '# Changelog\n\n## [0.1.1]\n' > CHANGELOG.md; git add -A
+git commit -q -m "carry the 0.1.1 changelog" -m "(cherry picked from commit $release)"
+sed -i.bak 's/0\.1\.0/0.2.0-beta.1/' Cargo.toml; rm -f ./*.bak; commit "0.2.0-beta.1"
+git tag v0.2.0-beta.1; git push -q origin beta v0.2.0-beta.1                      # a prerelease on beta
+carried beta
+[ "$code" -eq 0 ] || fail "life: main-in-beta is red before the cut: $(cat "$last")"
+#    the cut branch: beta's tip, main merged INTO it, the version conflict resolved there (beta takes no merge)
+git checkout -q -b cut beta
+if git merge -q --no-edit main >/dev/null 2>&1; then fail "life: the fixture's merge of main did not conflict"; fi
+git checkout -q --ours Cargo.toml; git add -A; git commit -q --no-edit
+run beta-born --base origin/main --head cut
+[ "$code" -eq 0 ] || fail "the cut's pull request (beta's tip with main merged in) was refused: $(cat "$last")"
+grep -q "beta-born: the cut: $(short cut) is origin/beta $(short beta)'s history with 1 merge(s) of main into it" "$last" \
+    || fail "the cut is not said: $(cat "$last")"
+#    the same cut branch with one commit born on it: refused, by name
+git checkout -q -b cut-extra cut
+echo born-on-the-cut > src/cut.rs; commit "born on the cut branch"
+run beta-born --base origin/main --head cut-extra
+[ "$code" -eq 1 ] || fail "a commit born on the cut branch passed (exit $code): $(cat "$last")"
+grep -q "beta-born: REFUSED $(short cut-extra) born on the cut branch" "$last" || fail "the commit born on the cut is not named: $(cat "$last")"
+#    a cut branch that merges a third branch: refused, the merge named
+git checkout -q -b third "$(git rev-list --max-parents=0 main)"; echo third > src/third.rs; commit "a third branch"
+git checkout -q -b cut-third beta; git merge -q --no-ff --no-edit -m "merge a third branch" third
+run beta-born --base origin/main --head cut-third
+[ "$code" -eq 1 ] || fail "a cut branch that merges a third branch passed (exit $code): $(cat "$last")"
+grep -q "beta-born: REFUSED $(short cut-third) merge a third branch" "$last" || fail "the third branch's merge is not named: $(cat "$last")"
+#    main takes the cut by ONE merge commit, first parent main, second parent the cut branch
+git checkout -q main; git merge -q --no-ff --no-edit -m "the cut" cut; git push -q origin main
+[ "$(git rev-parse main^1)" = "$(git rev-parse origin/main~1)" ] || fail "life: the merge's first parent is not main"
+git merge-base --is-ancestor v0.2.0-beta.1 main || fail "the prerelease tag is not an ancestor of main after the cut"
+[ -z "$(git rev-list beta ^main)" ] || fail "a beta sha is not an ancestor of main after the cut"
+carried beta
+[ "$code" -eq 0 ] || fail "main-in-beta is red on beta after the cut: $(cat "$last")"
+grep -q "main-in-beta: judged from the last cut $(short main) the cut" "$last" || fail "the last cut is not said: $(cat "$last")"
+#    a change born on beta after the cut, picked to main: both checks green
+git checkout -q beta; echo four > src/four.rs; commit "fix: four"; f4="$(git rev-parse HEAD)"; git push -q origin beta
+git checkout -q -b pick-4 main; git cherry-pick -x "$f4" >/dev/null
+run beta-born --base origin/main --head pick-4
+[ "$code" -eq 0 ] || fail "a pick made after the cut was refused: $(cat "$last")"
+git checkout -q main; git merge -q --ff-only pick-4; git push -q origin main
+carried beta
+[ "$code" -eq 0 ] || fail "main-in-beta is red after a pick made after the cut: $(cat "$last")"
+#    a second cut works the same way from the last one
+git checkout -q -b cut-2 beta; git merge -q --no-edit main >/dev/null
+run beta-born --base origin/main --head cut-2
+[ "$code" -eq 0 ] || fail "the second cut's pull request was refused: $(cat "$last")"
+git checkout -q main; git merge -q --no-ff --no-edit -m "the second cut" cut-2; git push -q origin main
+carried beta
+[ "$code" -eq 0 ] || fail "main-in-beta is red on beta after the second cut: $(cat "$last")"
+#    a commit born on main after the cut: beta-born refuses it; landed by force, main-in-beta goes red
+git checkout -q -b after main; echo after > src/after.rs; commit "born on main after the cut"
+run beta-born --base origin/main --head after
+[ "$code" -eq 1 ] || fail "a commit born on main after the cut passed beta-born (exit $code): $(cat "$last")"
+git push -q -f origin after:main
+carried beta
+[ "$code" -eq 1 ] || fail "main-in-beta is green though main holds a commit born after the cut (exit $code): $(cat "$last")"
+grep -q "main-in-beta: REFUSED $(short after) born on main after the cut" "$last" || fail "the commit born after the cut is not named: $(cat "$last")"
+cd "$scratch/repo"
+
 # 8. a check that cannot run is never a pass: a remote that does not answer
 git remote set-url origin "$scratch/gone.git"
 born fix-1
 [ "$code" -eq 2 ] || fail "beta-born with an unreachable remote answered $code, not 2: $(cat "$last")"
 
-echo "lines-test: PASS (no beta branch passes with the one line; a commit born on main refused by sha; a hand-resolved cherry-pick -x of a beta commit passes, a same-patch pick passes; a line naming a commit beta lacks, or no commit, refused; a release commit passes and is said, one that moves a dependency refused; the cut's own pull request passes, a merge commit refused; the marker read at the base: unborn passes, born with no branch fails, unreadable is exit 2; a borrowed line over other paths, a quoted line, an empty commit under a line and a beta link of other paths refused; a whitespace-only variant refused, the verbatim pick passes; main-in-beta green by main's own line, red on a fix beta lacks, green once carried by -x or by patch, red on an empty commit that only names it; a line naming a commit both lines hold refused by both checks; a release that repoints an internal dependency's path refused; an unreachable remote is exit 2)"
+echo "lines-test: PASS (no beta branch passes with the one line; a commit born on main refused by sha; a hand-resolved cherry-pick -x of a beta commit passes, a same-patch pick passes; a line naming a commit beta lacks, or no commit, refused; a release commit passes and is said, one that moves a dependency refused; the cut's own pull request passes, a merge commit refused; the marker read at the base: unborn passes, born with no branch fails, unreadable is exit 2; a borrowed line over other paths, a quoted line, an empty commit under a line and a beta link of other paths refused; a whitespace-only variant refused, the verbatim pick passes; main-in-beta green by main's own line, red on a fix beta lacks, green once carried by -x or by patch, red on an empty commit that only names it; a line naming a commit both lines hold refused by both checks; a release that repoints an internal dependency's path refused; a full life: the cut's pull request (beta's tip with main merged in) passes, one with a commit born on it or a merge of a third branch refused, a merge of main on a branch cut from main refused, main takes it by one merge commit and holds every beta sha and the prerelease tag, main-in-beta green after it and after a second cut, judged from the last cut, a pick made after the cut green on both checks, a commit born on main after the cut refused by both; an unreachable remote is exit 2)"
