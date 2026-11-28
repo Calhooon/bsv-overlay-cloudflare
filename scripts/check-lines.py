@@ -38,9 +38,17 @@ Python 3, standard library only; every fact is read from git in the current repo
       from <base> (a merge of `main` into the cut branch; its first parent is, by the walk, the beta
       commit the chain stops at or an earlier such merge). Anything else is refused by sha and subject:
       a non-merge commit (nothing is born on the cut branch), a merge of anything that is not `main`, a
-      commit such a merge brought in. What a merge's own conflict resolution contains is NOT compared:
-      a reviewer reads it. A pull request that is not the cut is judged by (1) to (5) above, its merges
-      refused; a head that IS beta's tip (nothing of `main` left to merge) has nothing to judge.
+      commit such a merge brought in. The chain must stop at <remote>/beta's TIP itself: a branch cut
+      from an older commit of `beta` is refused, naming the commit and the tip. For each merge of the
+      chain the paths `git show --remerge-diff` names (what its resolution wrote beyond a clean
+      re-merge of its parents; git 2.36 or later, an older git exits 2) are PRINTED, and a path present
+      in the merge and absent from BOTH parents (a file the resolution created) is REFUSED. The lines a
+      resolution changes inside files its parents hold are printed, not judged: a reviewer reads them.
+      A pull request that is not the cut is judged by (1) to (5) above, its merges refused, and a COPY
+      of one of beta's own version commits (rule (5)'s shape on beta since merge-base(beta, head),
+      matched by verbatim patch or by author, author date and subject, which a rebase keeps) is refused:
+      beta's versions reach main only by the cut, so a cut branch rebased onto main is refused. A head
+      that IS beta's tip (nothing of `main` left to merge) has nothing to judge.
       After a cut nothing more is needed here: the check judges only the pull request's own commits,
       and a pick made after the cut names a `beta` commit born after it, which the base does not hold.
       While <remote> has NO branch `beta`, the tracked marker `.github/lines`, read at <base> (never
@@ -67,6 +75,13 @@ Python 3, standard library only; every fact is read from git in the current repo
       it is on <tree> by sha, so the answer is the same.
       This is patch equivalence and links, never ancestry: `main` keeps linear history and takes
       commits by rebase, so the same change has one sha on `main` and another on `beta`.
+
+  check-lines.py cut-landed [--remote origin] [--cut <the cut branch>]
+      Item 16's last step, right after the cut's merge and before anything else lands on main: main's
+      tip is a merge commit with two parents whose second parent is a cut branch (the shape above, over
+      the merge's first parent) and, with --cut, is that branch's tip. Red, naming what it found, when
+      the tip is not a merge: REBASED when the tip's patch is a commit of beta's under a new sha,
+      SQUASHED otherwise.
 
 Exit 0: the rule holds. Exit 1: refused, each commit named. Exit 2: the check could not run (no such
 commit, a shallow clone, a remote that did not answer): never read as a pass.
@@ -244,8 +259,9 @@ def parents(sha):
 
 
 def cut_chain(head, beta, base):
-    """The cut's pull request: the head's first-parent chain of commits neither <beta> nor <base> holds,
-    when it holds a merge and stops at a commit of <beta> that <base> lacks; None otherwise."""
+    """The cut's pull request: (the head's first-parent chain of commits neither <beta> nor <base> holds, the
+    commit the walk stops at), when the chain holds a merge and stops at a commit of <beta> that <base>
+    lacks; None otherwise."""
     chain, sha = [], out("rev-parse", "--verify", f"{head}^{{commit}}")
     while not is_ancestor(sha, beta) and not is_ancestor(sha, base):
         chain.append(sha)
@@ -257,11 +273,45 @@ def cut_chain(head, beta, base):
         return None
     if is_ancestor(sha, base):
         return None
-    return chain
+    return chain, sha
 
 
-def judge_cut(args, beta, chain):
-    """Every commit of the cut's pull request that beta lacks is a merge of the base into the cut branch."""
+REMERGE_DIFF_GIT = (2, 36)
+
+
+def remerge_diff_paths(merge):
+    """The paths a merge's tree differs on from a clean automatic re-merge of its parents (`git show
+    --remerge-diff`, git 2.36 or later): what its conflict resolution wrote. A git without it cannot run."""
+    found = re.match(r"git version (\d+)\.(\d+)", out("version"))
+    if not found or tuple(int(part) for part in found.groups()) < REMERGE_DIFF_GIT:
+        raise CouldNotRun(f"`{out('version')}` has no `git show --remerge-diff` (git "
+                          f"{'.'.join(map(str, REMERGE_DIFF_GIT))} or later): a cut's merges cannot be read")
+    shown = out("show", "--remerge-diff", "--format=", "--name-only", "--no-renames", merge)
+    return sorted(set(row for row in shown.splitlines() if row.strip()))
+
+
+def created_by_merge(merge):
+    """The paths present in a merge's tree and absent from BOTH its parents: files its resolution created."""
+    added = None
+    for parent in parents(merge):
+        rows = set(out("diff-tree", "-r", "--no-commit-id", "--name-only", "--no-renames", "--diff-filter=A",
+                       parent, merge).splitlines())
+        added = rows if added is None else added & rows
+    return sorted(added or ())
+
+
+def judge_cut(args, beta, chain, stop):
+    """Every commit of the cut's pull request that beta lacks is a merge of the base into the cut branch, the
+    branch was cut from beta's TIP, and no merge's resolution creates a file neither parent has. What each
+    merge's resolution wrote beyond a clean re-merge is printed: a reviewer reads it."""
+    tip = out("rev-parse", "--verify", f"{beta}^{{commit}}")
+    if stop != tip:
+        line = (f"{NAME}: beta-born: REFUSED: the cut branch was cut from {subject(stop)}, a commit of beta that is "
+                f"not its tip {subject(tip)}: cut it again from {args.remote}/beta's tip (item 16, step 2)")
+        print(line)
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            print(f"::error::{line}")
+        return 1
     links = set(chain)
     missing = []
     for sha in out("rev-list", "--reverse", args.head, f"^{args.base}", f"^{beta}").split():
@@ -273,10 +323,49 @@ def judge_cut(args, beta, chain):
         return refuse("beta-born", missing,
                       "of the cut's pull request are neither on beta nor a merge of main into the cut branch "
                       "(nothing is born on the cut branch, and it merges main alone): land each on beta first")
+    merges = [sha for sha in reversed(chain) if len(parents(sha)) > 1]
+    created = []
+    for merge in merges:
+        wrote = remerge_diff_paths(merge)
+        said = ", ".join(wrote) if wrote else "nothing"
+        print(f"{NAME}: beta-born: the cut's merge {subject(merge)} writes, beyond a clean re-merge of its parents: "
+              f"{said} (read it: git show --remerge-diff {out('rev-parse', '--short', merge)})")
+        created += [(merge, path) for path in created_by_merge(merge)]
+    if created:
+        for merge, path in created:
+            print(f"{NAME}: beta-born: REFUSED {subject(merge)}: its resolution creates {path}, which neither "
+                  "parent has")
+        line = (f"{NAME}: beta-born: {len(created)} file(s) created by a merge of the cut branch: a cut's merge "
+                "resolves what its two parents hold and creates nothing (land the file on beta first)")
+        print(line)
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            print(f"::error::{line}")
+        return 1
     print(f"{NAME}: beta-born: the cut: {out('rev-parse', '--short', args.head)} is {args.remote}/beta "
-          f"{out('rev-parse', '--short', beta)}'s history with {sum(len(parents(c)) > 1 for c in chain)} merge(s) of main into it; the merges' "
-          "conflict resolution is not compared: a reviewer reads it")
+          f"{out('rev-parse', '--short', beta)}'s history with {len(merges)} merge(s) of main into it; the lines "
+          "each merge changes inside files its parents hold are printed above, not judged: a reviewer reads them")
     return 0
+
+
+def version_commits(beta, head):
+    """{verbatim patch id or identity: sha} of beta's own version commits (rule (5)'s shape: the root
+    manifest's version moved) since merge-base(beta, head). Identity is the author, the author date and the
+    subject, which a rebase keeps."""
+    base = git("merge-base", beta, head, check=False).stdout.strip()
+    span = [beta] + ([f"^{base}"] if base else [])
+    found = {}
+    wanted = [sha for sha in out("rev-list", "--no-merges", *span).split() if release_commit(sha)]
+    if wanted:
+        ids = patch_ids(*span)
+        for sha in wanted:
+            if sha in ids:
+                found[ids[sha]] = sha
+            found[identity(sha)] = sha
+    return found
+
+
+def identity(sha):
+    return "identity " + out("log", "-1", "--format=%ae%x00%ad%x00%s", "--date=raw", sha)
 
 
 def last_cut(main, tree):
@@ -317,12 +406,21 @@ def beta_born(args):
               "so every pull request into main passes")
         return 0
     base = out("merge-base", args.base, args.head)
-    chain = cut_chain(args.head, beta, args.base)
-    if chain is not None:
-        return judge_cut(args, beta, chain)
+    found = cut_chain(args.head, beta, args.base)
+    if found is not None:
+        return judge_cut(args, beta, *found)
     merges = out("rev-list", "--merges", f"{base}..{args.head}", f"^{beta}").split()
     names = names_on(beta, args.head)
     missing = list(merges)
+    versions = version_commits(beta, args.head)
+    if versions:
+        mine = patch_ids(args.head, f"^{base}", f"^{beta}")
+        copies = [sha for sha in out("rev-list", "--no-merges", "--reverse", args.head, f"^{base}", f"^{beta}").split()
+                  if mine.get(sha) in versions or identity(sha) in versions]
+        if copies:
+            return refuse("beta-born", copies,
+                          "of this pull request are copies of beta's own version commits, which reach main only by "
+                          "the cut's merge commit (a rebased cut branch? cut it again from beta's tip: item 16)")
     for sha in unplaced(beta, args.head, base):
         if linked(sha, beta, args.base, names):
             continue
@@ -363,6 +461,53 @@ def main_in_beta(args):
     return 0
 
 
+def cut_landed(args):
+    """Item 16's last step, run by the captain right after the cut's merge and before anything else lands on
+    main: main's tip is a merge commit with two parents, its first parent main as it was, its second the cut
+    branch (cut_chain's shape over beta). Red, naming what it found, when the cut was squashed or rebased."""
+    whole_history()
+    main = remote_line(args.remote, "main")
+    beta = remote_line(args.remote, "beta")
+    if main is None or beta is None:
+        raise CouldNotRun(f"{args.remote} has no branch `{'main' if main is None else 'beta'}`")
+    tip = out("rev-parse", "--verify", f"{main}^{{commit}}")
+    up = parents(tip)
+
+    def red(why):
+        line = f"{NAME}: cut-landed: REFUSED {subject(tip)}: {why}"
+        print(line)
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            print(f"::error::{line}")
+        return 1
+
+    if len(up) != 2:
+        held = set(patch_ids(beta, f"^{up[0]}" if up else beta).values()) if up else set()
+        mine = patch_ids(tip, f"^{up[0]}") if up else {}
+        if mine.get(tip) in held:
+            how = "REBASED (its patch is a commit of beta's under a new sha; the merges are gone)"
+        else:
+            how = "SQUASHED (one commit, not a commit of beta's)"
+        return red(f"main's tip has {len(up)} parent(s), not a merge commit: the cut was {how}; every beta sha and "
+                   "prerelease tag stays off main (item 16)")
+    found = cut_chain(up[1], beta, up[0])
+    if found is None:
+        return red(f"main's tip is a merge whose second parent {subject(up[1])} is not a cut branch (no merge of main "
+                   "on a first-parent chain cut from beta)")
+    chain, stop = found
+    strays = [sha for sha in chain if len(parents(sha)) != 2 or not is_ancestor(parents(sha)[1], up[0])]
+    if strays:
+        return red(f"its second parent carries {len(strays)} commit(s) that are not merges of main: "
+                   + "; ".join(subject(sha) for sha in strays))
+    if args.cut and out("rev-parse", "--verify", f"{args.cut}^{{commit}}") != up[1]:
+        return red(f"its second parent {subject(up[1])} is not the cut branch's tip {subject(args.cut)}")
+    beta_tip = out("rev-parse", "--verify", f"{beta}^{{commit}}")
+    held = "is" if is_ancestor(beta_tip, tip) else "is NOT (beta moved after the cut was made)"
+    print(f"{NAME}: cut-landed: main's tip {out('rev-parse', '--short', tip)} is a merge commit: first parent "
+          f"{out('rev-parse', '--short', up[0])}, second the cut branch {out('rev-parse', '--short', up[1])} cut from "
+          f"beta {out('rev-parse', '--short', stop)}; beta's tip {out('rev-parse', '--short', beta_tip)} {held} on main")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(prog=NAME, description="The two lines' direction rule (RELEASING.md).")
     checks = parser.add_subparsers(dest="check", required=True)
@@ -375,6 +520,10 @@ def main():
     carried.add_argument("--tree", default="HEAD", help="the tree judged (a merge commit, beta's tip)")
     carried.add_argument("--remote", default="origin")
     carried.set_defaults(run=main_in_beta)
+    landed = checks.add_parser("cut-landed", help="after the cut: main's tip is the cut's merge commit")
+    landed.add_argument("--remote", default="origin")
+    landed.add_argument("--cut", help="the cut branch's tip, compared with the merge's second parent")
+    landed.set_defaults(run=cut_landed)
     args = parser.parse_args()
     try:
         return args.run(args)
