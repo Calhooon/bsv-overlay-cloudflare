@@ -1323,6 +1323,12 @@ mod tests {
                 scripts.push(vec![a, b]);
             }
         }
+        // A declared push length far past the script's end (LOCK-0815).
+        scripts.push(vec![0x4e, 0xff, 0xff, 0xff, 0xff]);
+        scripts.push(vec![0x4e, 0xff, 0xff, 0xff, 0xff, 0x51, 0xac]);
+        scripts.push(vec![0x51, 0x4e, 0xfe, 0xff, 0xff, 0xff, 0x6a, 0x51]);
+        scripts.push(vec![0x4d, 0xff, 0xff, 0xac]);
+        scripts.push(vec![0x4c, 0xff, 0xac]);
         let mut seed: u64 = 0x5eed_e592;
         for _ in 0..20_000 {
             let mut script = Vec::new();
@@ -1375,6 +1381,14 @@ mod tests {
             ],
             vec![OP_ENDIF, OP_ENDIF, OP_RETURN, 0x01],
             vec![OP_VERNOTIF, OP_ENDIF, OP_RETURN],
+            // A declared push length far past the script's end (LOCK-0815):
+            // one chunk holding what is there, as the SDK cuts it.
+            vec![OP_PUSHDATA4, 0xff, 0xff, 0xff, 0xff],
+            vec![OP_PUSHDATA4, 0xff, 0xff, 0xff, 0xff, OP_1, OP_2],
+            vec![OP_PUSHDATA4, 0xff, 0xff, 0xff, 0x7f, OP_1],
+            vec![OP_1, OP_PUSHDATA4, 0xfe, 0xff, 0xff, 0xff, OP_RETURN, OP_1],
+            vec![OP_PUSHDATA2, 0xff, 0xff, OP_1],
+            vec![OP_PUSHDATA1, 0xff, OP_1],
         ];
         let interesting = [
             0x00,
