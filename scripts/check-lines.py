@@ -6,8 +6,7 @@ Python 3, standard library only; every fact is read from git in the current repo
   check-lines.py beta-born --base <sha> --head <sha> [--remote origin]
       A pull request into `main`. Every commit of merge-base(base, head)..head must have been born on
       `beta`. A commit passes when ONE of these holds, read in this order:
-        (1) it is reachable from <remote>/beta (by sha): this is how the CUT's own pull request is
-            recognised, with no flag and no title: its head is beta's tip, so no commit is left to judge;
+        (1) it is reachable from <remote>/beta (by sha);
         (2) <remote>/beta holds a commit of the same patch, compared VERBATIM (`git patch-id
             --verbatim`: whitespace counts, where `git cherry` strips it): a pick whose sha moved and
             whose patch did not, with or without its `-x` line;
@@ -29,7 +28,21 @@ Python 3, standard library only; every fact is read from git in the current repo
             lines removed and the lines added are the same once the version is taken out); and the root
             manifest's version is among them.
       Anything else is refused by sha and subject. A MERGE commit not reachable from <remote>/beta is
-      refused too (`git cherry` does not read merges, and `main`'s history is linear).
+      refused too (`git cherry` does not read merges, and `main`'s history is linear), except on the cut.
+      THE CUT'S PULL REQUEST (RELEASING.md item 16), recognised by its shape, with no flag and no title.
+      Walk the head's FIRST-PARENT chain from the head while the commit is reachable neither from
+      <remote>/beta nor from <base>; the pull request is the cut when that chain holds a merge and the
+      commit the walk stops at is reachable from <remote>/beta and not from <base> (the branch was cut
+      from `beta`, not from `main`). On the cut, every commit of <base>..<head> that <remote>/beta does
+      not hold must be a commit of that chain with exactly two parents whose SECOND parent is reachable
+      from <base> (a merge of `main` into the cut branch; its first parent is, by the walk, the beta
+      commit the chain stops at or an earlier such merge). Anything else is refused by sha and subject:
+      a non-merge commit (nothing is born on the cut branch), a merge of anything that is not `main`, a
+      commit such a merge brought in. What a merge's own conflict resolution contains is NOT compared:
+      a reviewer reads it. A pull request that is not the cut is judged by (1) to (5) above, its merges
+      refused; a head that IS beta's tip (nothing of `main` left to merge) has nothing to judge.
+      After a cut nothing more is needed here: the check judges only the pull request's own commits,
+      and a pick made after the cut names a `beta` commit born after it, which the base does not hold.
       While <remote> has NO branch `beta`, the tracked marker `.github/lines`, read at <base> (never
       from the pull request), decides: `beta unborn` (or no marker) passes with one line, the line is
       not born yet and the repository stays mergeable; `beta born` is a FAILURE (exit 1): a line that
@@ -43,6 +56,15 @@ Python 3, standard library only; every fact is read from git in the current repo
       the naming commit must NOT be empty (a link that carries nothing carries nothing), and its
       paths are not bounded: a release commit of `main` moves versions `beta` does not share, so the
       commit of `beta` that names it carries what it says (the changelog). No release-commit exception.
+      Only the commits of <remote>/main AFTER THE LAST CUT are judged: those not reachable from the
+      newest commit of main's first-parent chain (`git rev-list --first-parent --merges`) that has
+      exactly two parents and whose SECOND parent holds a commit of <tree> its FIRST parent does not
+      (some `git merge-base --all <second parent> <tree>` is not an ancestor of the first parent): the
+      merge by which `main` took `beta`. Everything at or before it was reconciled by the cut itself,
+      and every commit of `beta` up to the cut is then reachable from `main`, so an older pick's line
+      names a commit both lines hold and could no longer place it. With no cut, every commit of main is
+      judged. A merge from before the birth reads as a cut by this rule too; every commit at or before
+      it is on <tree> by sha, so the answer is the same.
       This is patch equivalence and links, never ancestry: `main` keeps linear history and takes
       commits by rebase, so the same change has one sha on `main` and another on `beta`.
 
@@ -217,6 +239,59 @@ def release_commit(sha):
     return bumped
 
 
+def parents(sha):
+    return out("rev-list", "--parents", "-n1", sha).split()[1:]
+
+
+def cut_chain(head, beta, base):
+    """The cut's pull request: the head's first-parent chain of commits neither <beta> nor <base> holds,
+    when it holds a merge and stops at a commit of <beta> that <base> lacks; None otherwise."""
+    chain, sha = [], out("rev-parse", "--verify", f"{head}^{{commit}}")
+    while not is_ancestor(sha, beta) and not is_ancestor(sha, base):
+        chain.append(sha)
+        up = parents(sha)
+        if not up:
+            return None
+        sha = up[0]
+    if not any(len(parents(link)) > 1 for link in chain):
+        return None
+    if is_ancestor(sha, base):
+        return None
+    return chain
+
+
+def judge_cut(args, beta, chain):
+    """Every commit of the cut's pull request that beta lacks is a merge of the base into the cut branch."""
+    links = set(chain)
+    missing = []
+    for sha in out("rev-list", "--reverse", args.head, f"^{args.base}", f"^{beta}").split():
+        up = parents(sha)
+        if sha in links and len(up) == 2 and is_ancestor(up[1], args.base):
+            continue
+        missing.append(sha)
+    if missing:
+        return refuse("beta-born", missing,
+                      "of the cut's pull request are neither on beta nor a merge of main into the cut branch "
+                      "(nothing is born on the cut branch, and it merges main alone): land each on beta first")
+    print(f"{NAME}: beta-born: the cut: {out('rev-parse', '--short', args.head)} is {args.remote}/beta "
+          f"{out('rev-parse', '--short', beta)}'s history with {sum(len(parents(c)) > 1 for c in chain)} merge(s) of main into it; the merges' "
+          "conflict resolution is not compared: a reviewer reads it")
+    return 0
+
+
+def last_cut(main, tree):
+    """The newest merge of main's first-parent chain whose second parent holds a commit of <tree> its first
+    parent does not: the merge by which main took beta. None when main has taken no cut."""
+    for sha in out("rev-list", "--first-parent", "--merges", main).split():
+        up = parents(sha)
+        if len(up) != 2:
+            continue
+        bases = git("merge-base", "--all", up[1], tree, check=False).stdout.split()
+        if any(not is_ancestor(found, up[0]) for found in bases):
+            return sha
+    return None
+
+
 def refuse(check, missing, why):
     for sha in missing:
         print(f"{NAME}: {check}: REFUSED {subject(sha)}")
@@ -242,6 +317,9 @@ def beta_born(args):
               "so every pull request into main passes")
         return 0
     base = out("merge-base", args.base, args.head)
+    chain = cut_chain(args.head, beta, args.base)
+    if chain is not None:
+        return judge_cut(args, beta, chain)
     merges = out("rev-list", "--merges", f"{base}..{args.head}", f"^{beta}").split()
     names = names_on(beta, args.head)
     missing = list(merges)
@@ -271,7 +349,10 @@ def main_in_beta(args):
         raise CouldNotRun(f"{args.remote} has no branch `main`")
     tree = out("rev-parse", "--verify", f"{args.tree}^{{commit}}")
     names = names_on(tree, main)
-    missing = [sha for sha in unplaced(tree, main) if not linked(sha, tree, main, names, bound_both=False)]
+    cut = last_cut(main, tree)
+    if cut:
+        print(f"{NAME}: main-in-beta: judged from the last cut {subject(cut)}")
+    missing = [sha for sha in unplaced(tree, main, cut) if not linked(sha, tree, main, names, bound_both=False)]
     if missing:
         return refuse("main-in-beta", missing,
                       "of main are not on this tree (no sha, no verbatim patch, no cherry-pick line either way from a "
