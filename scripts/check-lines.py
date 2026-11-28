@@ -76,15 +76,21 @@ Python 3, standard library only; every fact is read from git in the current repo
       This is patch equivalence and links, never ancestry: `main` keeps linear history and takes
       commits by rebase, so the same change has one sha on `main` and another on `beta`.
 
-  check-lines.py cut-landed [--remote origin] [--cut <the cut branch>]
-      Item 16's last step, right after the cut's merge and before anything else lands on main: main's
-      tip is a merge commit with two parents whose second parent is a cut branch (the shape above, over
-      the merge's first parent) and, with --cut, is that branch's tip. Red, naming what it found, when
-      the tip is not a merge: REBASED when the tip's patch is a commit of beta's under a new sha,
-      SQUASHED otherwise.
+  check-lines.py cut-landed --cut <the cut branch> [--remote origin]
+      Item 16's step 9, run by the captain after the cut's merge. It finds THE LAST CUT on main's
+      first-parent chain (main-in-beta's definition, over beta) and judges THAT merge, whatever landed on
+      main after it: green when its second parent is --cut's tip and that branch has the cut's shape (its
+      first-parent chain over the merge's first parent holds only merges of main and stops at a commit of
+      beta), saying how many commits landed after it. Red, named: --cut names an EARLIER cut (a newer one
+      landed); the last cut's second parent carries commits that are not merges of main; main, after the
+      last cut (or, with none, outside beta), holds a copy of one of the cut branch's own version commits
+      (by verbatim patch, or by author, author date and subject): the cut was REBASED; or a commit whose
+      tree is the cut branch's tree: the cut was SQUASHED. Exit 3 when none of these holds: the named cut
+      has not landed (with no cut on main since the birth, "no cut has landed").
 
 Exit 0: the rule holds. Exit 1: refused, each commit named. Exit 2: the check could not run (no such
-commit, a shallow clone, a remote that did not answer): never read as a pass.
+commit, a shallow clone, a remote that did not answer): never read as a pass. Exit 3 (cut-landed only):
+the named cut has not landed on main.
 """
 import argparse
 import os
@@ -279,15 +285,39 @@ def cut_chain(head, beta, base):
 REMERGE_DIFF_GIT = (2, 36)
 
 
+KINDS = {"A": "added", "D": "deleted", "M": "modified", "T": "type changed"}
+
+
 def remerge_diff_paths(merge):
-    """The paths a merge's tree differs on from a clean automatic re-merge of its parents (`git show
-    --remerge-diff`, git 2.36 or later): what its conflict resolution wrote. A git without it cannot run."""
+    """What a merge's tree writes beyond a clean automatic re-merge of its parents (`git show --remerge-diff`,
+    git 2.36 or later), what its conflict resolution wrote: [(path, its kind against the re-merge: added,
+    deleted, modified or type changed; for a modified file the lines it added and removed, and the lines the
+    merge's file holds)]. A git without it cannot run."""
     found = re.match(r"git version (\d+)\.(\d+)", out("version"))
     if not found or tuple(int(part) for part in found.groups()) < REMERGE_DIFF_GIT:
         raise CouldNotRun(f"`{out('version')}` has no `git show --remerge-diff` (git "
                           f"{'.'.join(map(str, REMERGE_DIFF_GIT))} or later): a cut's merges cannot be read")
-    shown = out("show", "--remerge-diff", "--format=", "--name-only", "--no-renames", merge)
-    return sorted(set(row for row in shown.splitlines() if row.strip()))
+    kinds, counts = {}, {}
+    for row in out("show", "--remerge-diff", "--format=", "--name-status", "--no-renames", merge).splitlines():
+        status, _, path = row.partition("\t")
+        if path:
+            kinds[path] = KINDS.get(status[:1], f"status {status}")
+    for row in out("show", "--remerge-diff", "--format=", "--numstat", "--no-renames", merge).splitlines():
+        cells = row.split("\t")
+        if len(cells) == 3:
+            counts[cells[2]] = (cells[0], cells[1])
+    said = []
+    for path in sorted(kinds):
+        kind = kinds[path]
+        if kind == "modified":
+            added, removed = counts.get(path, ("?", "?"))
+            if added == "-":
+                kind = "modified, binary"
+            else:
+                held = git("show", f"{merge}:{path}", check=False).stdout.count("\n")
+                kind = f"modified, +{added} -{removed} of the {held} line(s) it holds"
+        said.append((path, kind))
+    return said
 
 
 def created_by_merge(merge):
@@ -327,7 +357,7 @@ def judge_cut(args, beta, chain, stop):
     created = []
     for merge in merges:
         wrote = remerge_diff_paths(merge)
-        said = ", ".join(wrote) if wrote else "nothing"
+        said = "; ".join(f"{path} ({kind})" for path, kind in wrote) if wrote else "nothing"
         print(f"{NAME}: beta-born: the cut's merge {subject(merge)} writes, beyond a clean re-merge of its parents: "
               f"{said} (read it: git show --remerge-diff {out('rev-parse', '--short', merge)})")
         created += [(merge, path) for path in created_by_merge(merge)]
@@ -347,21 +377,22 @@ def judge_cut(args, beta, chain, stop):
     return 0
 
 
-def version_commits(beta, head):
-    """{verbatim patch id or identity: sha} of beta's own version commits (rule (5)'s shape: the root
-    manifest's version moved) since merge-base(beta, head). Identity is the author, the author date and the
-    subject, which a rebase keeps."""
-    base = git("merge-base", beta, head, check=False).stdout.strip()
-    span = [beta] + ([f"^{base}"] if base else [])
-    found = {}
-    wanted = [sha for sha in out("rev-list", "--no-merges", *span).split() if release_commit(sha)]
+def version_copies_of(span_of_versions, span_judged):
+    """The commits of `span_judged` (rev-list arguments, non-merge) that copy a version commit of
+    `span_of_versions` by verbatim patch or by identity."""
+    versions = {}
+    wanted = [sha for sha in out("rev-list", "--no-merges", *span_of_versions).split() if release_commit(sha)]
     if wanted:
-        ids = patch_ids(*span)
+        ids = patch_ids(*span_of_versions)
         for sha in wanted:
             if sha in ids:
-                found[ids[sha]] = sha
-            found[identity(sha)] = sha
-    return found
+                versions[ids[sha]] = sha
+            versions[identity(sha)] = sha
+    if not versions:
+        return []
+    mine = patch_ids(*span_judged)
+    return [sha for sha in out("rev-list", "--no-merges", "--reverse", *span_judged).split()
+            if mine.get(sha) in versions or identity(sha) in versions]
 
 
 def identity(sha):
@@ -412,15 +443,16 @@ def beta_born(args):
     merges = out("rev-list", "--merges", f"{base}..{args.head}", f"^{beta}").split()
     names = names_on(beta, args.head)
     missing = list(merges)
-    versions = version_commits(beta, args.head)
-    if versions:
-        mine = patch_ids(args.head, f"^{base}", f"^{beta}")
-        copies = [sha for sha in out("rev-list", "--no-merges", "--reverse", args.head, f"^{base}", f"^{beta}").split()
-                  if mine.get(sha) in versions or identity(sha) in versions]
-        if copies:
-            return refuse("beta-born", copies,
-                          "of this pull request are copies of beta's own version commits, which reach main only by "
-                          "the cut's merge commit (a rebased cut branch? cut it again from beta's tip: item 16)")
+    since = git("merge-base", beta, args.head, check=False).stdout.strip()
+    copies = version_copies_of([beta] + ([f"^{since}"] if since else []), [args.head, f"^{base}", f"^{beta}"])
+    if copies:
+        return refuse("beta-born", copies,
+                      "of this pull request are copies of beta's own version commits, which reach main only by "
+                      "the cut's merge commit (a rebased cut branch? cut it again from beta's tip: item 16). If a "
+                      "commit named is no copy (item 18 names two coincidences: a release commit carried to beta "
+                      "before its own pull request merged, a scripted commit with the same author, second and "
+                      "subject), make it again: `git commit --amend --no-edit --date=now`, and where its patch is "
+                      "a beta commit's too, change its CHANGELOG.md text")
     for sha in unplaced(beta, args.head, base):
         if linked(sha, beta, args.base, names):
             continue
@@ -462,50 +494,64 @@ def main_in_beta(args):
 
 
 def cut_landed(args):
-    """Item 16's last step, run by the captain right after the cut's merge and before anything else lands on
-    main: main's tip is a merge commit with two parents, its first parent main as it was, its second the cut
-    branch (cut_chain's shape over beta). Red, naming what it found, when the cut was squashed or rebased."""
+    """Item 16's step 9: the last cut on main (last_cut over beta) is the merge commit of the named cut branch,
+    whatever landed after it. Red, named, when --cut names an earlier cut, when the cut was rebased or
+    squashed; exit 3 when the named cut has not landed."""
     whole_history()
     main = remote_line(args.remote, "main")
     beta = remote_line(args.remote, "beta")
     if main is None or beta is None:
         raise CouldNotRun(f"{args.remote} has no branch `{'main' if main is None else 'beta'}`")
-    tip = out("rev-parse", "--verify", f"{main}^{{commit}}")
-    up = parents(tip)
+    named = out("rev-parse", "--verify", f"{args.cut}^{{commit}}")
 
-    def red(why):
-        line = f"{NAME}: cut-landed: REFUSED {subject(tip)}: {why}"
+    def say(code, why):
+        line = f"{NAME}: cut-landed: {'REFUSED: ' if code == 1 else ''}{why}"
         print(line)
-        if os.environ.get("GITHUB_ACTIONS") == "true":
+        if code == 1 and os.environ.get("GITHUB_ACTIONS") == "true":
             print(f"::error::{line}")
-        return 1
+        return code
 
-    if len(up) != 2:
-        held = set(patch_ids(beta, f"^{up[0]}" if up else beta).values()) if up else set()
-        mine = patch_ids(tip, f"^{up[0]}") if up else {}
-        if mine.get(tip) in held:
-            how = "REBASED (its patch is a commit of beta's under a new sha; the merges are gone)"
-        else:
-            how = "SQUASHED (one commit, not a commit of beta's)"
-        return red(f"main's tip has {len(up)} parent(s), not a merge commit: the cut was {how}; every beta sha and "
-                   "prerelease tag stays off main (item 16)")
-    found = cut_chain(up[1], beta, up[0])
-    if found is None:
-        return red(f"main's tip is a merge whose second parent {subject(up[1])} is not a cut branch (no merge of main "
-                   "on a first-parent chain cut from beta)")
-    chain, stop = found
-    strays = [sha for sha in chain if len(parents(sha)) != 2 or not is_ancestor(parents(sha)[1], up[0])]
-    if strays:
-        return red(f"its second parent carries {len(strays)} commit(s) that are not merges of main: "
-                   + "; ".join(subject(sha) for sha in strays))
-    if args.cut and out("rev-parse", "--verify", f"{args.cut}^{{commit}}") != up[1]:
-        return red(f"its second parent {subject(up[1])} is not the cut branch's tip {subject(args.cut)}")
-    beta_tip = out("rev-parse", "--verify", f"{beta}^{{commit}}")
-    held = "is" if is_ancestor(beta_tip, tip) else "is NOT (beta moved after the cut was made)"
-    print(f"{NAME}: cut-landed: main's tip {out('rev-parse', '--short', tip)} is a merge commit: first parent "
-          f"{out('rev-parse', '--short', up[0])}, second the cut branch {out('rev-parse', '--short', up[1])} cut from "
-          f"beta {out('rev-parse', '--short', stop)}; beta's tip {out('rev-parse', '--short', beta_tip)} {held} on main")
-    return 0
+    cut = last_cut(main, beta)
+    if cut is not None:
+        up = parents(cut)
+        after = len(out("rev-list", "--first-parent", main, f"^{cut}").split())
+        if up[1] == named:
+            found = cut_chain(up[1], beta, up[0])
+            if found is None:
+                return say(1, f"the last cut {subject(cut)} has as second parent {subject(up[1])}, which is not a "
+                              "cut branch (no merge of main on a first-parent chain cut from beta)")
+            chain, stop = found
+            strays = [sha for sha in chain if len(parents(sha)) != 2 or not is_ancestor(parents(sha)[1], up[0])]
+            if strays:
+                return say(1, f"the last cut {subject(cut)}: its second parent carries {len(strays)} commit(s) that "
+                              "are not merges of main: " + "; ".join(subject(sha) for sha in strays))
+            beta_tip = out("rev-parse", "--verify", f"{beta}^{{commit}}")
+            held = "is" if is_ancestor(beta_tip, main) else "is NOT (beta moved after the cut was made)"
+            print(f"{NAME}: cut-landed: the last cut {out('rev-parse', '--short', cut)} on main is a merge commit: "
+                  f"first parent {out('rev-parse', '--short', up[0])}, second the cut branch "
+                  f"{out('rev-parse', '--short', up[1])} cut from beta {out('rev-parse', '--short', stop)}; "
+                  f"{after} commit(s) landed on main after it; beta's tip {out('rev-parse', '--short', beta_tip)} "
+                  f"{held} on main")
+            return 0
+        for older in out("rev-list", "--first-parent", "--merges", f"{cut}^1").split():
+            if parents(older)[1:2] == [named]:
+                return say(1, f"{args.cut} is an EARLIER cut, landed as {subject(older)}; the last cut on main is "
+                              f"{subject(cut)} (name its cut branch)")
+    span = [main, f"^{beta}"] + ([f"^{cut}"] if cut else [])
+    copies = version_copies_of([named, f"^{main}"], span)
+    if copies:
+        return say(1, f"main holds {subject(copies[0])}, a copy of a version commit of the cut branch "
+                      f"{subject(named)} under a new sha: the cut was REBASED (the merges are gone); every beta sha "
+                      "and prerelease tag stays off main (item 16)")
+    tree = out("rev-parse", f"{named}^{{tree}}")
+    for sha in out("rev-list", "--first-parent", "--no-merges", *span).split():
+        if out("rev-parse", f"{sha}^{{tree}}") == tree:
+            return say(1, f"main holds {subject(sha)}, one commit with the cut branch {subject(named)}'s tree: the "
+                          "cut was SQUASHED; every beta sha and prerelease tag stays off main (item 16)")
+    if cut is None:
+        return say(3, f"no cut has landed: main's first-parent chain holds no cut since the birth (and no rebase or "
+                      f"squash of {subject(named)})")
+    return say(3, f"the cut branch {subject(named)} has not landed: the last cut on main is {subject(cut)}")
 
 
 def main():
@@ -522,7 +568,7 @@ def main():
     carried.set_defaults(run=main_in_beta)
     landed = checks.add_parser("cut-landed", help="after the cut: main's tip is the cut's merge commit")
     landed.add_argument("--remote", default="origin")
-    landed.add_argument("--cut", help="the cut branch's tip, compared with the merge's second parent")
+    landed.add_argument("--cut", required=True, help="the cut branch (or its tip), compared with the last cut's second parent")
     landed.set_defaults(run=cut_landed)
     args = parser.parse_args()
     try:

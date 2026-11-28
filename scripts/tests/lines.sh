@@ -268,7 +268,7 @@ run beta-born --base origin/main --head cut
 [ "$code" -eq 0 ] || fail "the cut's pull request (beta's tip with main merged in) was refused: $(cat "$last")"
 grep -q "beta-born: the cut: $(short cut) is origin/beta $(short beta)'s history with 1 merge(s) of main into it" "$last" \
     || fail "the cut is not said: $(cat "$last")"
-grep -q "beta-born: the cut's merge $(short cut) .* writes, beyond a clean re-merge of its parents: Cargo.toml (read it: git show --remerge-diff $(short cut))" "$last" \
+grep -q "beta-born: the cut's merge $(short cut) .* writes, beyond a clean re-merge of its parents: Cargo.toml (modified, +0 -4 of the 2 line(s) it holds) (read it: git show --remerge-diff $(short cut))" "$last" \
     || fail "the honest cut's resolution in Cargo.toml is not printed: $(cat "$last")"
 #    the same cut branch with one commit born on it: refused, by name
 git checkout -q -b cut-extra cut
@@ -282,8 +282,17 @@ git checkout -q -b cut-third beta; git merge -q --no-ff --no-edit -m "merge a th
 run beta-born --base origin/main --head cut-third
 [ "$code" -eq 1 ] || fail "a cut branch that merges a third branch passed (exit $code): $(cat "$last")"
 grep -q "beta-born: REFUSED $(short cut-third) merge a third branch" "$last" || fail "the third branch's merge is not named: $(cat "$last")"
+#    cut-landed before any cut: no cut has landed, its own exit (3), never a green and never a squash or a rebase
+run cut-landed --cut cut
+[ "$code" -eq 3 ] || fail "life: cut-landed before any cut answered $code, not 3: $(cat "$last")"
+grep -q "cut-landed: no cut has landed: main's first-parent chain holds no cut since the birth" "$last" \
+    || fail "life: cut-landed before any cut does not say no cut has landed: $(cat "$last")"
 #    main takes the cut by ONE merge commit, first parent main, second parent the cut branch
 git checkout -q main; git merge -q --no-ff --no-edit -m "the cut" cut; git push -q origin main
+run cut-landed --cut cut
+[ "$code" -eq 0 ] || fail "life: cut-landed is red right after the cut: $(cat "$last")"
+grep -q "cut-landed: the last cut $(short main) on main is a merge commit: .*; 0 commit(s) landed on main after it" "$last" \
+    || fail "life: cut-landed right after the cut does not say it: $(cat "$last")"
 [ "$(git rev-parse main^1)" = "$(git rev-parse origin/main~1)" ] || fail "life: the merge's first parent is not main"
 git merge-base --is-ancestor v0.2.0-beta.1 main || fail "the prerelease tag is not an ancestor of main after the cut"
 [ -z "$(git rev-list beta ^main)" ] || fail "a beta sha is not an ancestor of main after the cut"
@@ -298,11 +307,24 @@ run beta-born --base origin/main --head pick-4
 git checkout -q main; git merge -q --ff-only pick-4; git push -q origin main
 carried beta
 [ "$code" -eq 0 ] || fail "main-in-beta is red after a pick made after the cut: $(cat "$last")"
+#    cut-landed after the cut and one later pick: still the cut, judged where it is on main's chain
+run cut-landed --cut cut
+[ "$code" -eq 0 ] || fail "life: cut-landed is red after the cut and one later pick: $(cat "$last")"
+grep -q "cut-landed: the last cut $(short main~1) on main is a merge commit: .*second the cut branch $(short cut) .*; 1 commit(s) landed on main after it" "$last" \
+    || fail "life: cut-landed after a later pick does not name the cut and the commit after it: $(cat "$last")"
 #    a second cut works the same way from the last one
 git checkout -q -b cut-2 beta; git merge -q --no-edit main >/dev/null
 run beta-born --base origin/main --head cut-2
 [ "$code" -eq 0 ] || fail "the second cut's pull request was refused: $(cat "$last")"
 git checkout -q main; git merge -q --no-ff --no-edit -m "the second cut" cut-2; git push -q origin main
+run cut-landed --cut cut-2
+[ "$code" -eq 0 ] || fail "life: cut-landed is red on the second cut: $(cat "$last")"
+grep -q "cut-landed: the last cut $(short main) on main is a merge commit: .*second the cut branch $(short cut-2) " "$last" \
+    || fail "life: cut-landed does not name the second cut: $(cat "$last")"
+run cut-landed --cut cut
+[ "$code" -eq 1 ] || fail "life: cut-landed is green on the first cut's branch after a second cut (exit $code): $(cat "$last")"
+grep -q "cut-landed: REFUSED: cut is an EARLIER cut, landed as $(short main~1~1) the cut; the last cut on main is $(short main) the second cut" "$last" \
+    || fail "life: the earlier cut is not named: $(cat "$last")"
 carried beta
 [ "$code" -eq 0 ] || fail "main-in-beta is red on beta after the second cut: $(cat "$last")"
 #    a commit born on main after the cut: beta-born refuses it; landed by force, main-in-beta goes red
@@ -351,8 +373,22 @@ git checkout -q -b cut-append beta; git merge -q --no-commit main >/dev/null 2>&
 echo EVIL >> src/feat.rs; git add -A; git commit -q --no-edit
 run beta-born --base origin/main --head cut-append
 [ "$code" -eq 0 ] || fail "cutx: a merge that appends a line was refused: $(cat "$last")"
-grep -q "writes, beyond a clean re-merge of its parents: src/feat.rs (read it: git show --remerge-diff $(short cut-append))" "$last" \
+grep -q "writes, beyond a clean re-merge of its parents: src/feat.rs (modified, +1 -0 of the 2 line(s) it holds) (read it: git show --remerge-diff $(short cut-append))" "$last" \
     || fail "cutx: the appended line's file is not printed: $(cat "$last")"
+#     a merge that DELETES a file both parents hold, and one that rewrites a file wholly: passed (a reviewer's),
+#     each printed by its kind, never as a few lines of a resolution
+git checkout -q -b cut-delete beta; git merge -q --no-commit main >/dev/null 2>&1 || true
+git rm -q src/feat2.rs; git commit -q --no-edit
+run beta-born --base origin/main --head cut-delete
+[ "$code" -eq 0 ] || fail "cutx: a merge that deletes a file was refused: $(cat "$last")"
+grep -q "writes, beyond a clean re-merge of its parents: src/feat2.rs (deleted) (read it: git show --remerge-diff $(short cut-delete))" "$last" \
+    || fail "cutx: the deleted file is not printed as deleted: $(cat "$last")"
+git checkout -q -b cut-rewrite beta; git merge -q --no-commit main >/dev/null 2>&1 || true
+printf 'a\nb\nc\nd\n' > src/lib.rs; git add -A; git commit -q --no-edit
+run beta-born --base origin/main --head cut-rewrite
+[ "$code" -eq 0 ] || fail "cutx: a merge that rewrites a file was refused: $(cat "$last")"
+grep -q "writes, beyond a clean re-merge of its parents: src/lib.rs (modified, +4 -1 of the 4 line(s) it holds) (read it: git show --remerge-diff $(short cut-rewrite))" "$last" \
+    || fail "cutx: the rewritten file is not printed with its lines: $(cat "$last")"
 #     a git without `git show --remerge-diff` cannot read the merges: exit 2, never a pass
 mkdir -p "$scratch/oldgit"; realgit="$(command -v git)"
 printf '#!/bin/sh\nif [ "$1" = version ]; then echo "git version 2.30.0"; exit 0; fi\nexec "%s" "$@"\n' "$realgit" > "$scratch/oldgit/git"
@@ -373,31 +409,35 @@ run beta-born --base origin/main --head cut-rebased
 [ "$code" -eq 1 ] || fail "cutx: a rebased cut branch passed (exit $code): $(cat "$last")"
 grep -q "beta-born: REFUSED $(short cut-rebased) 0.2.0" "$last" && grep -q "copies of beta's own version commits" "$last" \
     || fail "cutx: the rebased version commit is not named: $(cat "$last")"
-#     cut-landed, after the merge: green on the merge commit; red, named, on a squash and on a rebase
+grep -q "If a commit named is no copy (item 18 names two coincidences: .*make it again: \`git commit --amend --no-edit --date=now\`" "$last" \
+    || fail "cutx: the copy's refusal does not say what to do when it is no copy: $(cat "$last")"
+#     cut-landed, before the merge: no cut has landed (exit 3); after it: green on the merge commit; red, named,
+#     on a squash and on a rebase
 before="$(git rev-parse origin/main)"
+run cut-landed --cut cutx
+[ "$code" -eq 3 ] || fail "cutx: cut-landed before the cut answered $code, not 3: $(cat "$last")"
 git checkout -q main; git merge -q --no-ff --no-edit -m "the cut" cutx; git push -q origin main
 run cut-landed --cut cutx
 [ "$code" -eq 0 ] || fail "cutx: cut-landed is red on the cut's merge commit: $(cat "$last")"
-grep -q "cut-landed: main's tip $(short main) is a merge commit: first parent $(short "$before"), second the cut branch $(short cutx) cut from beta $(short beta)" "$last" \
+grep -q "cut-landed: the last cut $(short main) on main is a merge commit: first parent $(short "$before"), second the cut branch $(short cutx) cut from beta $(short beta)" "$last" \
     || fail "cutx: cut-landed does not say the merge: $(cat "$last")"
 git checkout -q -b squashed "$before"; git merge -q --squash cutx >/dev/null; git commit -qm "the cut (squashed)"
 git push -q -f origin squashed:main
 run cut-landed --cut cutx
 [ "$code" -eq 1 ] || fail "cutx: cut-landed is green on a squash (exit $code): $(cat "$last")"
-grep -q "cut-landed: REFUSED $(short squashed) the cut (squashed): main's tip has 1 parent(s), not a merge commit: the cut was SQUASHED" "$last" \
+grep -q "cut-landed: REFUSED: main holds $(short squashed) the cut (squashed), one commit with the cut branch $(short cutx) .*'s tree: the cut was SQUASHED" "$last" \
     || fail "cutx: the squash is not named: $(cat "$last")"
 git push -q -f origin cut-rebased:main
 run cut-landed --cut cutx
 [ "$code" -eq 1 ] || fail "cutx: cut-landed is green on a rebase (exit $code): $(cat "$last")"
-grep -q "cut-landed: REFUSED $(short cut-rebased) 0.2.0: main's tip has 1 parent(s), not a merge commit: the cut was REBASED" "$last" \
+grep -q "cut-landed: REFUSED: main holds $(short cut-rebased) 0.2.0, a copy of a version commit of the cut branch $(short cutx) .* the cut was REBASED" "$last" \
     || fail "cutx: the rebase is not named: $(cat "$last")"
 git checkout -q -b side "$before"; echo side > src/side.rs; commit "side"
 git checkout -q -b notcut "$before"; git merge -q --no-ff --no-edit -m "a merge that is not the cut" side
 git push -q -f origin notcut:main
-run cut-landed
-[ "$code" -eq 1 ] || fail "cutx: cut-landed is green on a merge that is not the cut (exit $code): $(cat "$last")"
-grep -q "cut-landed: REFUSED $(short notcut) a merge that is not the cut: main's tip is a merge whose second parent $(short side) side is not a cut branch" "$last" \
-    || fail "cutx: the merge that is not the cut is not named: $(cat "$last")"
+run cut-landed --cut cutx
+[ "$code" -eq 3 ] || fail "cutx: cut-landed on a merge that is not the cut answered $code, not 3: $(cat "$last")"
+grep -q "cut-landed: no cut has landed" "$last" || fail "cutx: a merge that is not the cut is not read as no cut: $(cat "$last")"
 cd "$scratch/repo"
 
 # 8. a check that cannot run is never a pass: a remote that does not answer
@@ -405,4 +445,4 @@ git remote set-url origin "$scratch/gone.git"
 born fix-1
 [ "$code" -eq 2 ] || fail "beta-born with an unreachable remote answered $code, not 2: $(cat "$last")"
 
-echo "lines-test: PASS (no beta branch passes with the one line; a commit born on main refused by sha; a hand-resolved cherry-pick -x of a beta commit passes, a same-patch pick passes; a line naming a commit beta lacks, or no commit, refused; a release commit passes and is said, one that moves a dependency refused; the cut's own pull request passes, a merge commit refused; the marker read at the base: unborn passes, born with no branch fails, unreadable is exit 2; a borrowed line over other paths, a quoted line, an empty commit under a line and a beta link of other paths refused; a whitespace-only variant refused, the verbatim pick passes; main-in-beta green by main's own line, red on a fix beta lacks, green once carried by -x or by patch, red on an empty commit that only names it; a line naming a commit both lines hold refused by both checks; a release that repoints an internal dependency's path refused; a full life: the cut's pull request (beta's tip with main merged in) passes, one with a commit born on it or a merge of a third branch refused, a merge of main on a branch cut from main refused, main takes it by one merge commit and holds every beta sha and the prerelease tag, main-in-beta green after it and after a second cut, judged from the last cut, a pick made after the cut green on both checks, a commit born on main after the cut refused by both; a cut's merge printed by what it writes beyond a clean re-merge, one that creates a file refused, a git without --remerge-diff exit 2, a cut from an old beta commit refused, a rebased cut branch refused, cut-landed green on the merge commit and red on a squash, on a rebase and on a merge that is not the cut; an unreachable remote is exit 2)"
+echo "lines-test: PASS (no beta branch passes with the one line; a commit born on main refused by sha; a hand-resolved cherry-pick -x of a beta commit passes, a same-patch pick passes; a line naming a commit beta lacks, or no commit, refused; a release commit passes and is said, one that moves a dependency refused; the cut's own pull request passes, a merge commit refused; the marker read at the base: unborn passes, born with no branch fails, unreadable is exit 2; a borrowed line over other paths, a quoted line, an empty commit under a line and a beta link of other paths refused; a whitespace-only variant refused, the verbatim pick passes; main-in-beta green by main's own line, red on a fix beta lacks, green once carried by -x or by patch, red on an empty commit that only names it; a line naming a commit both lines hold refused by both checks; a release that repoints an internal dependency's path refused; a full life: the cut's pull request (beta's tip with main merged in) passes, one with a commit born on it or a merge of a third branch refused, a merge of main on a branch cut from main refused, main takes it by one merge commit and holds every beta sha and the prerelease tag, main-in-beta green after it and after a second cut, judged from the last cut, a pick made after the cut green on both checks, a commit born on main after the cut refused by both; a cut's merge printed by what it writes beyond a clean re-merge, one that creates a file refused, a git without --remerge-diff exit 2, a cut from an old beta commit refused, a rebased cut branch refused, a deleted and a rewritten file printed by their kind; cut-landed: no cut has landed (exit 3) before any cut and on a merge that is not the cut, green right after the cut, after a later pick and on a second cut, red on an earlier cut named after a second, on a squash and on a rebase; an unreachable remote is exit 2)"
