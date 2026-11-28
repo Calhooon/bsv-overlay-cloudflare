@@ -384,6 +384,16 @@ async fn signature_under_swapped_identity_is_refused() {
 /// signature verification — the key derivation binds the counterparty
 /// identity + session nonce, which is exactly the pairing a mocked verify
 /// once hid (`signin.ts`).
+///
+/// Amended for LOCK-0814 (bsv-rs 0.8.14, GHSA-wh67-gjx6-4qqh): every incoming
+/// message now goes through bsv-rs's one verifying path, which checks, in the
+/// reference's order (`Peer.ts`), that the sender is the authenticated peer of
+/// the session its echoed nonce names BEFORE it verifies the signature. The
+/// swapped message echoes the CLIENT's session nonce under the attacker's
+/// identity, so it is refused by that binding ("general identity does not
+/// match the authenticated session."), where 0.8.13 reached the signature. The
+/// verdict is the same and binds the same pairing (identity to session); the
+/// refusal still never names a missing session, and nothing is delivered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn swapped_identity_with_live_attacker_session_is_refused_by_signature() {
     let client_key = PrivateKey::random();
@@ -522,11 +532,21 @@ async fn swapped_identity_with_live_attacker_session_is_refused_by_signature() {
     .await;
 
     let errs = errors.lock().unwrap().clone();
+    let refusals: Vec<String> = errs[errors_before..]
+        .iter()
+        .map(|e| e.to_ascii_lowercase())
+        .collect();
     assert!(
-        errs.iter()
-            .any(|e| e.to_ascii_lowercase().contains("signature")),
-        "with a live attacker session the refusal must come from SIGNATURE \
-         verification (the counterparty pairing), not a missing session; got {errs:?}"
+        refusals.iter().any(|e| e.contains("signature")
+            || e.contains("identity does not match the authenticated session")),
+        "with a live attacker session the refusal must come from the counterparty \
+         pairing (the session's identity or the signature), not a missing session; got {errs:?}"
+    );
+    assert!(
+        !refusals
+            .iter()
+            .any(|e| e.contains("no session") || e.contains("session not found")),
+        "the refusal never names a missing session; got {errs:?}"
     );
     let got = received.lock().unwrap().clone();
     assert_eq!(got.len(), 2, "the swapped message must never be delivered");
