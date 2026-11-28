@@ -505,6 +505,48 @@ mod tests {
         );
     }
 
+    /// LOCK-0815 (bsv-rs 0.8.15): a key whose first byte is the SEC 1 tag 05
+    /// is no key at the identity signature's door. bsv-rs 0.8.14 read
+    /// `05 || x` as the compressed key `02 || x`; 0.8.15's
+    /// `PublicKey::from_bytes` refuses the tag, and the door answers `false`.
+    #[test]
+    fn lock0815_a_05_tagged_identity_does_not_verify() {
+        let m = golden(GOLDEN_V1_HEX);
+        let challenge = potparty_v1_challenge(
+            &m.identity,
+            &m.opponent,
+            &m.game_id,
+            &m.pot_txid,
+            m.pot_vout,
+            m.recovery_height,
+        )
+        .expect("the golden's fields are sized");
+        assert!(verify_identity_sig(
+            &m.identity,
+            &m.game_id,
+            &challenge,
+            &m.sig
+        ));
+        assert_eq!(
+            m.identity[0], 0x02,
+            "the golden's identity is an even-Y key"
+        );
+        let mut tagged = m.identity.clone();
+        tagged[0] = 0x05;
+        assert!(
+            !verify_identity_sig(&tagged, &m.game_id, &challenge, &m.sig),
+            "the signature of 02 || x does not verify under 05 || x"
+        );
+        assert!(
+            bsv_rs::primitives::ec::PublicKey::from_bytes(&tagged).is_err(),
+            "a 05-tagged key does not parse"
+        );
+        assert!(
+            bsv_rs::primitives::ec::PublicKey::from_hex(&hex::encode(&tagged)).is_err(),
+            "nor from hex"
+        );
+    }
+
     /// Every field the challenge binds is load-bearing, on BOTH versions:
     /// tamper it and the latch drops to `false`. Injected by MUTATING the
     /// golden, so nothing here is signed by this crate.
