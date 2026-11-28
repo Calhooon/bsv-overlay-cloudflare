@@ -1584,6 +1584,57 @@ mod tests {
         assert_eq!(advert_host(b"garbage", 0, TOPIC), None);
     }
 
+    /// Lane NAMES: the fan-out's admission is the SHIP topic manager's, whose
+    /// name rule is the reference's at
+    /// `57c5f13055b555b83c1ef368fff3650abd21b6ef`
+    /// (`/^(?=.{1,256}$)(?:tm_|ls_)[a-z0-9]+(?:_[a-z0-9]+)*$/`): a host
+    /// advertising a topic whose name carries digits, or is 200 bytes long,
+    /// receives the fan-out; one advertising a 257-byte topic does not.
+    #[test]
+    fn fanout0811_names_a_digit_topic_and_a_200_byte_topic_name_their_host() {
+        let per_asset = format!("tm_color_{}_0", "0123456789abcdef".repeat(4));
+        let long = format!("tm_{}", "a1".repeat(98) + "z");
+        assert_eq!(long.len(), 200);
+        let at_bound = format!("tm_{}", "a".repeat(253));
+        for topic in [per_asset.as_str(), "tm_uhrp_files2", &long, &at_bound] {
+            let key = PrivateKey::random();
+            let lock = bsv_rs::overlay::create_signed_overlay_admin_token(
+                &key,
+                Protocol::Ship,
+                "https://peer.example/",
+                topic,
+            );
+            assert!(
+                matches!(
+                    SHIPTopicManager::admissible_advert(&output_of(lock.clone())),
+                    Ok(Some(_))
+                ),
+                "{topic}: the SHIP admission admits it"
+            );
+            assert_eq!(
+                advert_host(&beef_of_lock(lock), 0, topic).as_deref(),
+                Some("https://peer.example"),
+                "{topic}"
+            );
+            // The repository's own writer builds the same advertisement.
+            let beef = beef_of_lock(signed_lock("https://peer.example/", topic));
+            assert_eq!(
+                advert_host(&beef, 0, topic).as_deref(),
+                Some("https://peer.example"),
+                "{topic}"
+            );
+        }
+        let past = format!("tm_{}", "a".repeat(254));
+        let lock = bsv_rs::overlay::create_signed_overlay_admin_token(
+            &PrivateKey::random(),
+            Protocol::Ship,
+            "https://peer.example/",
+            &past,
+        );
+        assert!(SHIPTopicManager::admissible_advert(&output_of(lock.clone())).is_err());
+        assert_eq!(advert_host(&beef_of_lock(lock), 0, &past), None);
+    }
+
     #[test]
     fn fanout0811_the_advert_is_read_from_the_beefs_subject_not_the_wire_last() {
         // The subject carries the valid advert at output 0 and spends the

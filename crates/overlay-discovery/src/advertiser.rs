@@ -274,6 +274,44 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Lane NAMES: the advertiser builds, and reads back, an advertisement of
+    /// a name with digits and of a 200-byte name (the reference's rule at
+    /// `57c5f13055b555b83c1ef368fff3650abd21b6ef`); 257 bytes is refused.
+    #[tokio::test]
+    async fn names_the_advertiser_creates_and_parses_digit_and_200_byte_names() {
+        let adv = make_advertiser();
+        let per_asset = format!("color_{}_0", "0123456789abcdef".repeat(4));
+        let long = "a1".repeat(98) + "z";
+        assert_eq!(long.len() + 3, 200);
+        for body in [per_asset.as_str(), "uhrp_files2", &long] {
+            for (protocol, prefix) in [(Protocol::Ship, "tm_"), (Protocol::Slap, "ls_")] {
+                let name = format!("{prefix}{body}");
+                let script = adv
+                    .build_ad_script(protocol, &name)
+                    .unwrap_or_else(|e| panic!("{name}: {e}"));
+                let parsed = adv.parse_advertisement(&script.to_binary()).unwrap();
+                assert_eq!(parsed.protocol, protocol);
+                assert_eq!(parsed.topic_or_service, name);
+                let created = adv
+                    .create_advertisements(&[AdvertisementData {
+                        protocol,
+                        topic_or_service_name: name.clone(),
+                    }])
+                    .await;
+                assert!(created.is_ok(), "{name}: {created:?}");
+            }
+        }
+        let past = format!("tm_{}", "a".repeat(254));
+        assert!(adv.build_ad_script(Protocol::Ship, &past).is_err());
+        let created = adv
+            .create_advertisements(&[AdvertisementData {
+                protocol: Protocol::Ship,
+                topic_or_service_name: past,
+            }])
+            .await;
+        assert!(created.is_err());
+    }
+
     // ── Create advertisements ──────────────────────────────────────────
 
     #[tokio::test]

@@ -307,6 +307,41 @@ mod tests {
         assert!(result.unwrap());
     }
 
+    /// Lane NAMES: a topic whose name carries digits (a BRC-207 per-asset
+    /// name) and one of 200 bytes are SHIP advertisements this manager
+    /// admits, as the reference at
+    /// `57c5f13055b555b83c1ef368fff3650abd21b6ef` does; 256 is the last
+    /// length admitted.
+    #[test]
+    fn names_ship_admits_a_digit_topic_and_a_200_byte_topic() {
+        let signer = PrivateKey::random();
+        let per_asset = format!("tm_color_{}_0", "0123456789abcdef".repeat(4));
+        let long = format!("tm_{}", "a1".repeat(98) + "z");
+        assert_eq!(long.len(), 200);
+        let at_bound = format!("tm_{}", "a".repeat(253));
+        for topic in [per_asset.as_str(), "tm_uhrp_files2", &long, &at_bound] {
+            let output = make_signed_ship_output(&signer, "https://example.com", topic);
+            assert_eq!(
+                SHIPTopicManager::validate_ship_output(&output),
+                Ok(true),
+                "{topic}"
+            );
+            let advert = SHIPTopicManager::admissible_advert(&output)
+                .unwrap()
+                .unwrap();
+            assert_eq!(advert.topic, topic.as_bytes());
+        }
+        // One byte past the bound, and a digit name under the other prefix.
+        let past = format!("tm_{}", "a".repeat(254));
+        for topic in [past.as_str(), "ls_uhrp_files2"] {
+            let output = make_signed_ship_output(&signer, "https://example.com", topic);
+            assert!(
+                SHIPTopicManager::validate_ship_output(&output).is_err(),
+                "{topic}"
+            );
+        }
+    }
+
     #[test]
     fn reject_bad_signature() {
         // Properly structured but with a random (invalid) signature

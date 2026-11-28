@@ -256,6 +256,37 @@ mod tests {
         assert!(result.unwrap());
     }
 
+    /// Lane NAMES: a service whose name carries digits (a BRC-207 per-asset
+    /// name) and one of 200 bytes are SLAP advertisements this manager
+    /// admits, as the reference at
+    /// `57c5f13055b555b83c1ef368fff3650abd21b6ef` does; 256 is the last
+    /// length admitted.
+    #[test]
+    fn names_slap_admits_a_digit_service_and_a_200_byte_service() {
+        let signer = PrivateKey::random();
+        let per_asset = format!("ls_color_{}_0", "0123456789abcdef".repeat(4));
+        let long = format!("ls_{}", "a1".repeat(98) + "z");
+        assert_eq!(long.len(), 200);
+        let at_bound = format!("ls_{}", "a".repeat(253));
+        for service in [per_asset.as_str(), "ls_uhrp_files2", &long, &at_bound] {
+            let output = make_signed_slap_output(&signer, "https://example.com", service);
+            assert_eq!(
+                SLAPTopicManager::validate_slap_output(&output),
+                Ok(true),
+                "{service}"
+            );
+        }
+        // One byte past the bound, and a digit name under the other prefix.
+        let past = format!("ls_{}", "a".repeat(254));
+        for service in [past.as_str(), "tm_uhrp_files2"] {
+            let output = make_signed_slap_output(&signer, "https://example.com", service);
+            assert!(
+                SLAPTopicManager::validate_slap_output(&output).is_err(),
+                "{service}"
+            );
+        }
+    }
+
     #[test]
     fn reject_bad_signature() {
         let output = make_raw_slap_output(
