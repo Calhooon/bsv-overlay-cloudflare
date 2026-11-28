@@ -31,7 +31,7 @@ bsv-overlay-cloudflare/
 │   │       ├── agent/          # Agent registry topic manager + lookup
 │   │       ├── dm_delegation/  # Delegation-revocation topic manager + lookup
 │   │       ├── advertiser.rs   # WalletAdvertiser (PushDrop create/parse)
-│   │       └── validation.rs   # BRC-87 names, URI validation
+│   │       └── validation.rs   # topic and service names, URI validation
 │   │
 │   └── overlay-cloudflare/     # Cloudflare Workers deployment
 │       ├── src/
@@ -54,6 +54,10 @@ bsv-overlay-cloudflare/
     ├── src/                    #   reference @bsv/overlay-express@2.2.0 docker
     └── corpus/                 #   43 JSON request/response scenarios
 ```
+
+## The topic and lookup-service name rule is the reference's (lane NAMES, 2026-11-28)
+
+`overlay_discovery::validation::is_valid_topic_or_service_name` is the reference's `isValidTopicOrServiceName` (`@bsv/overlay-discovery-services`, `bsv-blockchain/ts-stack` `57c5f13055b555b83c1ef368fff3650abd21b6ef`, its head on 2026-11-28; the rule since its 2026-10-22 change), exactly `/^(?=.{1,256}$)(?:tm_|ls_)[a-z0-9]+(?:_[a-z0-9]+)*$/`: the prefix, then groups of lowercase letters and DIGITS joined by single underscores, at most 256 (`MAX_TOPIC_OR_SERVICE_NAME_BYTES`; counted in bytes, equal to the reference's UTF-16 units for every admitted name, all ASCII). It was letters only and 50, so an advertisement the reference admits (a per-asset `tm_color_<txid>_<vout>`, a long name) was refused here. Its callers, all in `overlay-discovery`: `SHIPTopicManager::admissible_advert` (so `validate_ship_output` and the worker's mainnet fan-out), `SLAPTopicManager::validate_slap_output`, `WalletAdvertiser::build_ad_script` (so both advertisers' create; the parse, bsv-rs's `decode_overlay_admin_token`, judges no name). Not judged by it, as before: a lookup QUERY (the reference refuses a `ls_ship` query topic that is not a valid `tm_` name and a `ls_slap` query service that is not a valid `ls_` name; not built here), a `/submit` topic, and a registered name (`TOPIC_SUFFIX` is appended to a registered name and the suffixed name is judged only when the advertiser advertises it: one past 256 fails that ad sync's create). Pins `-p bsv-overlay-discovery --lib names_` (the reference's 32 test vectors verbatim; a differential against a second spelling over every length 0 to 300 and generated names; each caller admitting a digit name and a 200-byte name) and the worker's `--lib fanout0811_names`. Re-read the reference's rule at its head when its discovery package moves.
 
 ## Two workspaces (bsv-low #553, 2026-10-06)
 

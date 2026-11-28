@@ -1,17 +1,35 @@
 //! Validation utilities for SHIP/SLAP overlay discovery.
 //!
 //! Ported from `~/bsv/overlay-discovery-services/src/utils/`:
-//! - `isValidTopicOrServiceName.ts` -- BRC-87 name validation
+//! - `isValidTopicOrServiceName.ts` -- topic and lookup-service name validation
 //! - `isAdvertisableURI.ts` -- URI scheme validation
 //! - `isTokenSignatureCorrectlyLinked.ts` -- ECDSA signature linking
 
-/// Check if a topic or service name is valid per BRC-87.
+/// The most bytes a topic or lookup-service name may hold: the reference's 256.
+pub const MAX_TOPIC_OR_SERVICE_NAME_BYTES: usize = 256;
+
+/// Check if a topic manager or lookup service name is canonical (BRC-87 names
+/// and the per-asset BRC-207 names, `tm_color_<txid>_<vout>`).
 ///
-/// Rules:
-/// - Must start with `tm_` (topic) or `ls_` (lookup service)
-/// - 1-50 characters total
-/// - Only lowercase letters and underscores after the prefix
-/// - No consecutive underscores, no trailing underscore
+/// The reference's rule, `isValidTopicOrServiceName` of
+/// `@bsv/overlay-discovery-services` at `bsv-blockchain/ts-stack`
+/// `57c5f13055b555b83c1ef368fff3650abd21b6ef` (its head on 2026-11-28; the rule
+/// as it stands since its 2026-10-22 change), is exactly
+///
+/// ```text
+/// /^(?=.{1,256}$)(?:tm_|ls_)[a-z0-9]+(?:_[a-z0-9]+)*$/
+/// ```
+///
+/// - the `tm_` (topic) or `ls_` (lookup service) prefix;
+/// - then groups of ASCII lowercase letters and digits, joined by single
+///   underscores: no empty group, so no doubled and no trailing underscore;
+/// - 1 to 256 in all. The reference's `.{1,256}` counts UTF-16 code units;
+///   this counts bytes. Every character the rule admits is ASCII, one byte
+///   and one code unit, so for every admitted name the two counts are equal,
+///   and a name with any other character is refused by the alphabet whatever
+///   its length.
+///
+/// No allocation: one pass over the bytes.
 ///
 /// # Examples
 /// ```
@@ -19,47 +37,34 @@
 /// assert!(is_valid_topic_or_service_name("tm_ship"));
 /// assert!(is_valid_topic_or_service_name("ls_slap"));
 /// assert!(is_valid_topic_or_service_name("tm_my_custom_topic"));
+/// assert!(is_valid_topic_or_service_name("tm_uhrp_files2"));
+/// assert!(is_valid_topic_or_service_name(&format!("ls_{}", "a".repeat(253))));
+/// assert!(!is_valid_topic_or_service_name(&format!("ls_{}", "a".repeat(254))));
 /// assert!(!is_valid_topic_or_service_name("invalid"));
 /// assert!(!is_valid_topic_or_service_name("tm_"));
 /// assert!(!is_valid_topic_or_service_name("TM_UPPER"));
 /// ```
 pub fn is_valid_topic_or_service_name(name: &str) -> bool {
-    // Regex: ^(?=.{1,50}$)(?:tm_|ls_)[a-z]+(?:_[a-z]+)*$
-    if name.is_empty() || name.len() > 50 {
+    let bytes = name.as_bytes();
+    if bytes.len() > MAX_TOPIC_OR_SERVICE_NAME_BYTES {
         return false;
     }
-
-    let rest = if let Some(r) = name
-        .strip_prefix("tm_")
-        .or_else(|| name.strip_prefix("ls_"))
-    {
-        r
-    } else {
-        return false;
+    let rest = match bytes {
+        [b't', b'm', b'_', rest @ ..] | [b'l', b's', b'_', rest @ ..] => rest,
+        _ => return false,
     };
 
-    if rest.is_empty() {
-        return false;
-    }
-
-    // Must be lowercase letters and underscores, with underscores only between letter groups
-    // Pattern: [a-z]+(_[a-z]+)*
-    let mut expect_letter = true;
-    for ch in rest.chars() {
-        if expect_letter {
-            if !ch.is_ascii_lowercase() {
-                return false;
-            }
-            expect_letter = false;
-        } else if ch == '_' {
-            expect_letter = true; // next char must be a letter
-        } else if !ch.is_ascii_lowercase() {
-            return false;
+    // [a-z0-9]+(?:_[a-z0-9]+)*: an underscore only after a letter or digit,
+    // and the name ends on a letter or digit.
+    let mut group_open = false;
+    for &b in rest {
+        match b {
+            b'a'..=b'z' | b'0'..=b'9' => group_open = true,
+            b'_' if group_open => group_open = false,
+            _ => return false,
         }
     }
-
-    // Must not end with underscore (expect_letter would be true)
-    !expect_letter
+    group_open
 }
 
 /// Recognized HTTPS-based URI scheme prefixes.
@@ -424,76 +429,294 @@ pub fn is_token_signature_correctly_linked_verbose(
 mod tests {
     use super::*;
 
-    // -- BRC-87 name validation -----------------------------------------
+    // -- Topic and lookup-service names -----------------------------------
+    //
+    // The reference: `bsv-blockchain/ts-stack`
+    // `57c5f13055b555b83c1ef368fff3650abd21b6ef`,
+    // `packages/overlays/overlay-discovery-services/src/utils/`.
 
-    #[test]
-    fn valid_topic_names() {
-        assert!(is_valid_topic_or_service_name("tm_ship"));
-        assert!(is_valid_topic_or_service_name("tm_slap"));
-        assert!(is_valid_topic_or_service_name("tm_a"));
-        assert!(is_valid_topic_or_service_name("tm_my_custom_topic"));
-        assert!(is_valid_topic_or_service_name("tm_abcdefghij"));
+    /// `__tests/isValidTopicOrServiceName.test.ts` at that commit, every
+    /// expectation in its order: `(name, expected)`.
+    fn reference_vectors() -> Vec<(String, bool)> {
+        let asset_id = format!("{}_0", "0123456789abcdef".repeat(4));
+        let v: Vec<(String, bool)> = vec![
+            // valid BRC-22 Topic Manager names
+            ("tm_uhrp_files".into(), true),
+            ("tm_tempo_songs".into(), true),
+            ("tm_a".into(), true),
+            ("tm_a_b_c".into(), true),
+            // valid BRC-24 Lookup Service names
+            ("ls_uhrp_files".into(), true),
+            ("ls_tempo_songs_search".into(), true),
+            ("ls_a".into(), true),
+            ("ls_a_b".into(), true),
+            // incorrect prefixes
+            ("tp_uhrp_files".into(), false),
+            ("um_tempo_songs".into(), false),
+            // uppercase letters
+            ("tm_Tempo_songs".into(), false),
+            ("ls_tempo_Songs".into(), false),
+            // starting or ending with an underscore
+            ("_tm_uhrp_files".into(), false),
+            ("tm_uhrp_files_".into(), false),
+            // consecutive underscores
+            ("tm__uhrp_files".into(), false),
+            ("ls_tempo__songs".into(), false),
+            // BRC-207 per-asset names
+            (format!("tm_color_{asset_id}"), true),
+            (format!("ls_color_{asset_id}"), true),
+            ("tm_uhrp_files2".into(), true),
+            // other characters
+            ("ls_tempo_songs-search".into(), false),
+            ("tm_uhrp%files".into(), false),
+            ("tm_uhrp files".into(), false),
+            ("tm_\u{00e9}".into(), false),
+            // a bare prefix and names without a prefix
+            ("tm_".into(), false),
+            ("ls_".into(), false),
+            ("tm__x".into(), false),
+            ("tm_x_".into(), false),
+            ("color_abc".into(), false),
+            // exceeding 256 bytes (257, then 300)
+            (format!("tm_{}", "a".repeat(254)), false),
+            (format!("tm_{}", "a".repeat(297)), false),
+            // exactly 256 bytes
+            (format!("ls_{}", "a".repeat(253)), true),
+            // the empty string
+            (String::new(), false),
+        ];
+        assert_eq!(v[28].0.len(), 257, "the reference's toHaveLength(257)");
+        assert_eq!(v[30].0.len(), 256, "the reference's toHaveLength(256)");
+        v
     }
 
     #[test]
-    fn valid_service_names() {
-        assert!(is_valid_topic_or_service_name("ls_ship"));
-        assert!(is_valid_topic_or_service_name("ls_slap"));
-        assert!(is_valid_topic_or_service_name("ls_my_lookup"));
+    fn names_the_references_own_vectors() {
+        let vectors = reference_vectors();
+        assert_eq!(vectors.len(), 32);
+        for (name, expected) in vectors {
+            assert_eq!(
+                is_valid_topic_or_service_name(&name),
+                expected,
+                "{name:?} ({} bytes)",
+                name.len()
+            );
+        }
+    }
+
+    /// A second spelling of
+    /// `/^(?=.{1,256}$)(?:tm_|ls_)[a-z0-9]+(?:_[a-z0-9]+)*$/`, for the tests
+    /// only: the lookahead as the reference counts it (UTF-16 code units, `.`
+    /// matching no line terminator), then the prefix, then every
+    /// underscore-separated group non-empty and of `[a-z0-9]` alone.
+    fn name_rule_by_groups(name: &str) -> bool {
+        let units = name.encode_utf16().count();
+        let lookahead = (1..=256).contains(&units)
+            && !name
+                .chars()
+                .any(|c| matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}'));
+        let rest = match (name.get(..3), name.get(3..)) {
+            (Some("tm_"), Some(rest)) | (Some("ls_"), Some(rest)) => rest,
+            _ => return false,
+        };
+        lookahead
+            && rest.split('_').all(|group| {
+                !group.is_empty() && group.chars().all(|c| matches!(c, 'a'..='z' | '0'..='9'))
+            })
     }
 
     #[test]
-    fn invalid_names_no_prefix() {
-        assert!(!is_valid_topic_or_service_name("ship"));
-        assert!(!is_valid_topic_or_service_name("hello"));
-        assert!(!is_valid_topic_or_service_name(""));
+    fn names_the_second_spelling_reads_the_references_vectors_too() {
+        for (name, expected) in reference_vectors() {
+            assert_eq!(name_rule_by_groups(&name), expected, "{name:?}");
+        }
+    }
+
+    /// The differential: every length 0 to 300 in several shapes, each shape
+    /// then mutated at the alphabet's edges, and generated strings over an
+    /// alphabet of admitted and refused characters; the rule and its second
+    /// spelling agree on every one.
+    #[test]
+    fn names_differential_against_the_second_spelling() {
+        let mut names: Vec<String> = Vec::new();
+        // One name of exactly `len` bytes whose body repeats `pattern`.
+        let shaped = |prefix: &str, pattern: &str, len: usize| -> String {
+            let mut s: String = prefix.chars().take(len).collect();
+            let mut body = pattern.chars().cycle();
+            while s.len() < len {
+                s.extend(body.next());
+            }
+            s
+        };
+        for len in 0..=300usize {
+            for prefix in ["tm_", "ls_", "xx_", "tm", "TM_", "_tm_"] {
+                for pattern in [
+                    "a", "z", "0", "9", "a1", "7b", "abc_", "0_1_", "a_", "_", "ab__", "A",
+                    "\u{e9}",
+                ] {
+                    let base = shaped(prefix, pattern, len);
+                    // The edges, as mutations of each shape.
+                    names.push(format!("{base}_"));
+                    names.push(format!("{base}a"));
+                    names.push(format!("{base}0"));
+                    names.push(format!("{base}\n"));
+                    names.push(format!(" {base}"));
+                    names.push(base.to_uppercase());
+                    if base.is_char_boundary(base.len() / 2) {
+                        let (head, tail) = base.split_at(base.len() / 2);
+                        for mid in ["_", "__", "5", "Q", "\u{e9}", "-", "\u{2028}", "\u{1d7d8}"] {
+                            names.push(format!("{head}{mid}{tail}"));
+                        }
+                    }
+                    names.push(base);
+                }
+            }
+        }
+        // Named edges.
+        for name in [
+            "tm_0",
+            "ls_9",
+            "tm_0a",
+            "tm_a0",
+            "tm_123",
+            "tm_1_2_3",
+            "tm_a_",
+            "tm_a__b",
+            "tm_A",
+            "tm_\u{e9}",
+            "tm_a\u{e9}",
+            "tm_\u{0660}",
+            "tm_\u{ff41}",
+            "tm_a\n",
+            "tm_a\r",
+            "tm-a",
+            "tm_a b",
+            "ls",
+            "tm",
+            "t",
+            "",
+        ] {
+            names.push(name.to_string());
+        }
+        names.push(format!("tm_{}", "a".repeat(253)));
+        names.push(format!("tm_{}", "a".repeat(254)));
+        names.push(format!("tm_{}", "0".repeat(253)));
+        names.push(format!("tm_{}", "0".repeat(254)));
+        names.push(format!("tm_{}9", "a_".repeat(126)));
+        names.push(format!("tm_{}9", "a_".repeat(127)));
+        // Generated strings (xorshift, fixed seed), biased to the admitted alphabet.
+        let alphabet: Vec<char> = "abmstlz0189___AZ -.\u{e9}\n".chars().collect();
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20_000 {
+            let len = (next() % 301) as usize;
+            let mut s = String::from(match next() % 4 {
+                0 => "tm_",
+                1 => "ls_",
+                2 => "",
+                _ => "tm",
+            });
+            // Mostly letters and digits, so that long names are often valid.
+            let noisy = next() % 3 == 0;
+            while s.len() < len {
+                let c = if noisy {
+                    alphabet[(next() % alphabet.len() as u64) as usize]
+                } else {
+                    match next() % 12 {
+                        0 => '_',
+                        1..=4 => (b'0' + (next() % 10) as u8) as char,
+                        _ => (b'a' + (next() % 26) as u8) as char,
+                    }
+                };
+                s.push(c);
+            }
+            names.push(s);
+        }
+
+        let (mut admitted, mut refused) = (0usize, 0usize);
+        let (mut longest_admitted, mut admitted_with_digit) = (0usize, 0usize);
+        for name in &names {
+            let got = is_valid_topic_or_service_name(name);
+            assert_eq!(
+                got,
+                name_rule_by_groups(name),
+                "{name:?} ({} bytes)",
+                name.len()
+            );
+            if got {
+                admitted += 1;
+                longest_admitted = longest_admitted.max(name.len());
+                admitted_with_digit += usize::from(name.bytes().any(|b| b.is_ascii_digit()));
+                assert!(name.is_ascii() && name.len() <= MAX_TOPIC_OR_SERVICE_NAME_BYTES);
+            } else {
+                refused += 1;
+            }
+        }
+        // The differential is not vacuous on either side.
+        assert!(admitted > 2_000, "admitted {admitted}");
+        assert!(refused > 2_000, "refused {refused}");
+        assert!(admitted_with_digit > 1_000, "{admitted_with_digit}");
+        assert_eq!(longest_admitted, 256);
     }
 
     #[test]
-    fn invalid_names_wrong_prefix() {
-        assert!(!is_valid_topic_or_service_name("TM_ship"));
-        assert!(!is_valid_topic_or_service_name("LS_slap"));
-        assert!(!is_valid_topic_or_service_name("xx_test"));
+    fn names_every_length_to_the_bound_and_none_past_it() {
+        for len in 0..=300usize {
+            for fill in ["a", "7"] {
+                let name = format!("tm_{}", fill.repeat(len));
+                assert_eq!(
+                    is_valid_topic_or_service_name(&name),
+                    (1..=253).contains(&len),
+                    "tm_ and {len} of {fill:?}"
+                );
+            }
+        }
     }
 
     #[test]
-    fn invalid_names_empty_after_prefix() {
-        assert!(!is_valid_topic_or_service_name("tm_"));
-        assert!(!is_valid_topic_or_service_name("ls_"));
+    fn names_digits_are_admitted_in_any_group() {
+        for name in [
+            "tm_test123",
+            "tm_1test",
+            "tm_0",
+            "ls_42",
+            "tm_a_1_b_2",
+            "tm_color_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef_0",
+        ] {
+            assert!(is_valid_topic_or_service_name(name), "{name}");
+        }
     }
 
     #[test]
-    fn invalid_names_uppercase() {
-        assert!(!is_valid_topic_or_service_name("tm_SHIP"));
-        assert!(!is_valid_topic_or_service_name("tm_Ship"));
-    }
-
-    #[test]
-    fn invalid_names_numbers() {
-        assert!(!is_valid_topic_or_service_name("tm_test123"));
-        assert!(!is_valid_topic_or_service_name("tm_1test"));
-    }
-
-    #[test]
-    fn invalid_names_trailing_underscore() {
-        assert!(!is_valid_topic_or_service_name("tm_test_"));
-    }
-
-    #[test]
-    fn invalid_names_consecutive_underscores() {
-        assert!(!is_valid_topic_or_service_name("tm_test__name"));
-    }
-
-    #[test]
-    fn invalid_names_too_long() {
-        let long_name = format!("tm_{}", "a".repeat(48)); // 51 chars total
-        assert!(!is_valid_topic_or_service_name(&long_name));
-    }
-
-    #[test]
-    fn valid_names_max_length() {
-        let name = format!("tm_{}", "a".repeat(47)); // exactly 50 chars
-        assert!(is_valid_topic_or_service_name(&name));
+    fn names_refused_shapes() {
+        for name in [
+            "",
+            "ship",
+            "hello",
+            "TM_ship",
+            "LS_slap",
+            "xx_test",
+            "tm_",
+            "ls_",
+            "tm_SHIP",
+            "tm_Ship",
+            "tm_test_",
+            "tm_test__name",
+            "tm__test",
+            "tm_1_",
+            "tm_1__2",
+            "tm_\u{661}",
+            "tm_a\n",
+            " tm_a",
+            "tm_a ",
+        ] {
+            assert!(!is_valid_topic_or_service_name(name), "{name:?}");
+        }
     }
 
     // -- URI validation -------------------------------------------------
