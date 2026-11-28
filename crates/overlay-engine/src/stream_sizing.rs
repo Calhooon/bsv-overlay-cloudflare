@@ -330,6 +330,10 @@ impl Sizer<'_> {
 
 /// What the proof limb read of a frame ([`proof_limb`]): how many BUMPs and
 /// BUMP nodes it carries, every BUMP and every level.
+///
+/// Non-exhaustive: outside this crate it is read by its fields and matched
+/// with `..`, so a later field does not break a caller.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProofFrame {
     /// The BUMP nodes the frame carries (a leaf at any level, hashed or
@@ -352,6 +356,10 @@ pub struct ProofFrame {
 
 /// A body whose merkle paths carry more nodes than the proof limb allows
 /// ([`proof_limb`]): nothing of it was parsed, hashed or allocated.
+///
+/// Non-exhaustive: outside this crate it is read by its fields and matched
+/// with `..`, so a later field does not break a caller.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProofLimbStop {
     /// The nodes counted when the read stopped: one past `bound`.

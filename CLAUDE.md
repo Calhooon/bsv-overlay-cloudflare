@@ -218,7 +218,11 @@ from `DoorBudget::DEFAULT` and its setters (`with_memory_limit`,
 `with_max_proof_nodes`, one per field): `DoorBudget`, `DoorLimb` and
 `WalkLimb` are `#[non_exhaustive]`, so outside the engine crate no budget is a
 struct literal and every `match` on a limb carries a wildcard arm (an unknown
-limb is "the walk could not run", counted with the over-budget row).
+`WalkLimb` is "the walk could not run" and an unknown `DoorLimb` is the door's
+own bound, each counted with its over-budget row). `stream_sizing::ProofFrame`
+and `ProofLimbStop` are `#[non_exhaustive]` too (read by their fields outside
+the crate), and `WalkLimb::same_bytes_will_fail` is an exhaustive match inside
+the engine, so a limb added later must say whether the same bytes can ever pass.
 
 **A breach is "the walk could not run"**, never a refusal, and (the E592 lens
 fold, 2026-10-10) NEVER AN ADMISSION WITHOUT THE NETWORK'S WORD. As built at
